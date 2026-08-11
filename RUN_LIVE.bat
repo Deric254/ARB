@@ -1,61 +1,40 @@
 @echo off
-title Spatial Arbitrage Engine v5.0 - LIVE
-
-echo ==========================================
-echo   SPATIAL ARBITRAGE ENGINE v5.0
-echo   LIVE MODE - REAL CAPITAL AT RISK
-echo ==========================================
+chcp 65001 >nul
+title ARB v5.1 — Spatial Arbitrage Engine [LIVE MODE]
+color 0C
 echo.
-if "%BINANCE_API_KEY%"=="" goto MISSING
-if "%BINANCE_API_SECRET%"=="" goto MISSING
-if "%KRAKEN_API_KEY%"=="" goto MISSING
-if "%KRAKEN_API_SECRET%"=="" goto MISSING
-goto FOUND
-
-:MISSING
-echo ERROR: API keys not set!
+echo  ╔══════════════════════════════════════════════════════════════════╗
+echo  ║         SPATIAL ARBITRAGE ENGINE v5.1 — LIVE MODE               ║
+echo  ║         REAL MONEY ON THE LINE — PROCEED WITH CAUTION            ║
+echo  ╚══════════════════════════════════════════════════════════════════╝
 echo.
-echo Where to get API keys:
-echo   BINANCE: https://www.binance.com/en/my/settings/api-management
-echo   KRAKEN:  https://www.kraken.com/u/security/api
-echo.
-echo Set them BEFORE running:
-echo   set BINANCE_API_KEY=your_key_here
-echo   set BINANCE_API_SECRET=your_secret_here
-echo   set KRAKEN_API_KEY=your_key_here
-echo   set KRAKEN_API_SECRET=your_secret_here
-echo.
-echo Or run SET_KEYS.bat first.
-echo.
-pause
-exit /b 1
-
-:FOUND
-echo [OK] API keys detected.
-
-set PYTHON_CMD=python
 python --version >nul 2>&1
 if errorlevel 1 (
-    set PYTHON_CMD=py
-    py --version >nul 2>&1
-    if errorlevel 1 (
-        echo ERROR: Python not found.
-        pause
-        exit /b 1
-    )
+    echo  [!] Python not found. Install from https://python.org
+    pause
+    exit /b 1
 )
 
-%PYTHON_CMD% -c "import ccxt, aiofiles" >nul 2>&1
-if errorlevel 1 %PYTHON_CMD% -m pip install -r requirements.txt
+if not exist .env (
+    echo  [!] API keys not set. Run SET_KEYS.bat first.
+    pause
+    exit /b 1
+)
 
-echo [OK] Starting LIVE mode...
-echo [INFO] Browser will open automatically in 4 seconds.
-echo [WARN] Sandbox safety is ON by default.
+for /f "tokens=1,2 delims==" %%a in (.env) do (
+    if "%%a"=="BINANCE_API_KEY" set BINANCE_API_KEY=%%b
+    if "%%a"=="BINANCE_API_SECRET" set BINANCE_API_SECRET=%%b
+    if "%%a"=="KRAKEN_API_KEY" set KRAKEN_API_KEY=%%b
+    if "%%a"=="KRAKEN_API_SECRET" set KRAKEN_API_SECRET=%%b
+)
+
+echo  [+] API keys loaded
+echo  [+] Installing dependencies...
+pip install -q ccxt aiofiles
+echo  [+] Starting LIVE engine...
+echo  [+] Dashboard: http://localhost:8080/status
 echo.
-
-start "" /B %PYTHON_CMD% -c "import time,os;time.sleep(4);os.system('start http://localhost:8080/status')"
-
-%PYTHON_CMD% arbitrage_engine.py --live --port 8080
-
+start "" "http://localhost:8080/status"
+python arbitrage_engine.py --live --port 8080
 echo.
 pause

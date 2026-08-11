@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-SPATIAL ARBITRAGE TRADING ENGINE — PRODUCTION v5.0
+SPATIAL ARBITRAGE TRADING ENGINE — PRODUCTION v5.1
 High-Frequency Cryptocurrency Arbitrage System
 ================================================================================
 
-ZERO-GAP ARCHITECTURE with REAL-TIME CHART DASHBOARD:
-  - Live Chart.js dashboard with auto-refresh
-  - KPI cards: P&L, Success Rate, Latency, Signals/min
-  - Real-time charts: P&L over time, Execution Latency (p50/p99),
-    Signal Rate, Exchange Spreads, Price Divergence
-  - Circuit Breaker, P&L Ledger, Latency Telemetry, Webhook Alerts
-  - Synthetic DEMO mode + LIVE WebSocket mode
+ZERO-GAP ARCHITECTURE with REAL-TIME CHART DASHBOARD + SLICERS:
+ - Live Chart.js dashboard with auto-refresh
+ - KPI cards: P&L, Success Rate, Latency, Signals/min, Trades, Spread
+ - Real-time charts: P&L over time, Execution Latency (p50/p99),
+   Signal Rate, Exchange Spreads, Price Divergence
+ - INTERACTIVE SLICERS: Time Range, Profit Filter, Exchange Pair, Status, Refresh Rate
+ - Trade Log Table with live filtering
+ - Circuit Breaker, P&L Ledger, Latency Telemetry, Webhook Alerts
+ - Synthetic DEMO mode + LIVE WebSocket mode
 
 Usage:
-    python arbitrage_engine.py              # DEMO mode, 120s, auto-opens browser
-    python arbitrage_engine.py --live       # LIVE mode (requires API keys)
-    python arbitrage_engine.py --duration 300 --port 8080
+ python arbitrage_engine.py              # DEMO mode, 120s, auto-opens browser
+ python arbitrage_engine.py --live       # LIVE mode (requires API keys)
+ python arbitrage_engine.py --duration 300 --port 8080
 
 Requirements:
-    pip install ccxt aiofiles
+ pip install ccxt aiofiles
 """
 
 import asyncio
@@ -55,7 +57,6 @@ try:
     import aiofiles
 except ImportError:
     raise ImportError("pip install aiofiles")
-
 
 # =============================================================================
 # CONFIGURATION & DATA STRUCTURES
@@ -194,7 +195,6 @@ class Position:
     unrealized_pnl: Decimal = Decimal("0")
     trade_count: int = 0
 
-
 # =============================================================================
 # LOGGING
 # =============================================================================
@@ -216,7 +216,6 @@ def setup_logging(log_level=logging.INFO):
     return logger
 
 LOG = setup_logging()
-
 
 # =============================================================================
 # HIGH-PRECISION CALCULATION ENGINE
@@ -273,7 +272,6 @@ class PrecisionCalculator:
             gas_fee=config.estimated_gas_fee, net_profit=net.quantize(Decimal("0.00000001")),
             net_profit_pct=net_pct, execution_id=eid)
 
-
 # =============================================================================
 # CIRCUIT BREAKER
 # =============================================================================
@@ -300,9 +298,9 @@ class CircuitBreaker:
             if self._state == "OPEN":
                 if time.time() - self._last_failure_time > self.risk_config.cooldown_seconds_after_failure:
                     self._state = "CLOSED"; self._consecutive_failures = 0
-                    return True
-                return False
-            return True
+                return True
+            return False
+        return True
 
     async def record_success(self, net_profit):
         async with self._lock:
@@ -335,7 +333,6 @@ class CircuitBreaker:
                 "consecutive_failures": self._consecutive_failures,
                 "daily_trades": self._daily_trades, "daily_pnl": str(self._daily_pnl)}
 
-
 # =============================================================================
 # LATENCY TELEMETRY
 # =============================================================================
@@ -364,7 +361,6 @@ class LatencyTracker:
     def get_metrics(self):
         return {"detection_us": self._stats(self._detection_us), "execution_us": self._stats(self._execution_us)}
 
-
 # =============================================================================
 # P&L LEDGER
 # =============================================================================
@@ -383,7 +379,7 @@ class ProfitLossLedger:
         async with self._lock:
             for ex_id in exchange_ids:
                 self.positions[ex_id] = Position(exchange_id=ex_id, symbol=self.symbol,
-                                                  base_asset=initial_base, quote_asset=initial_quote)
+                                                 base_asset=initial_base, quote_asset=initial_quote)
             LOG.info("[LEDGER] Positions initialized.")
 
     async def record_execution(self, result, signal):
@@ -399,8 +395,11 @@ class ProfitLossLedger:
             sell_pos.trade_count += 1
             self._total_realized_pnl += signal.net_profit
             self._trade_history.append({"timestamp": datetime.now(timezone.utc).isoformat(),
-                                         "execution_id": result.execution_id, "net_profit": str(signal.net_profit),
-                                         "latency_us": result.latency_us})
+                                        "execution_id": result.execution_id, "net_profit": str(signal.net_profit),
+                                        "latency_us": result.latency_us, "status": result.status,
+                                        "buy_exchange": result.buy_exchange.value, "sell_exchange": result.sell_exchange.value,
+                                        "buy_vwap": str(signal.buy_vwap), "sell_vwap": str(signal.sell_vwap),
+                                        "target_volume": str(signal.target_volume)})
             LOG.info("[LEDGER] P&L: %s | Total: %s" % (signal.net_profit, self._total_realized_pnl))
 
     async def mark_to_market(self, exchange_books):
@@ -410,7 +409,7 @@ class ProfitLossLedger:
                 book = exchange_books.get(ex_id)
                 if book and book.mid_price and pos.base_asset > Decimal("0"):
                     pos.unrealized_pnl = pos.base_asset * book.mid_price
-                    total += pos.unrealized_pnl
+                total += pos.unrealized_pnl
             self._total_unrealized_pnl = total
 
     def get_metrics(self):
@@ -420,15 +419,14 @@ class ProfitLossLedger:
                 "positions": {k.value: {"base": str(v.base_asset), "quote": str(v.quote_asset),
                                         "trades": v.trade_count, "unrealized": str(v.unrealized_pnl)}
                               for k, v in self.positions.items()},
-                "trade_count": len(self._trade_history)}
-
+                "trade_count": len(self._trade_history),
+                "trade_history": list(self._trade_history)}
 
 # =============================================================================
-# METRICS HISTORY — Time-series data for real-time charts
+# METRICS HISTORY
 # =============================================================================
 
 class MetricsHistory:
-    """Keeps rolling time-series buffers for live Chart.js dashboard."""
     def __init__(self, max_points=300):
         self.max_points = max_points
         self._timestamps = deque(maxlen=max_points)
@@ -459,7 +457,6 @@ class MetricsHistory:
             self._signals_detected.append(engine._signals_detected)
             self._signals_executed.append(engine._signals_executed)
             self._circuit_state.append(1 if circ["state"] == "CLOSED" else 0)
-            # Exchange spreads
             books = {}
             for ex_id, mgr in engine.exchanges.items():
                 try:
@@ -491,7 +488,6 @@ class MetricsHistory:
             "circuit_state": list(self._circuit_state),
         }
 
-
 # =============================================================================
 # ALERT MANAGER
 # =============================================================================
@@ -509,10 +505,10 @@ class AlertManager:
             now = time.time()
             if now - self._last_alert_time.get(level, 0) < self._rate_limit_seconds: return
             self._last_alert_time[level] = now
-        payload = {"level": level.value, "title": title, "message": message,
-                   "timestamp": datetime.now(timezone.utc).isoformat(), "fields": fields or {}}
-        try: asyncio.create_task(self._post_webhook(payload))
-        except Exception as e: LOG.warning("[ALERT] Queue failed: %s" % e)
+            payload = {"level": level.value, "title": title, "message": message,
+                       "timestamp": datetime.now(timezone.utc).isoformat(), "fields": fields or {}}
+            try: asyncio.create_task(self._post_webhook(payload))
+            except Exception as e: LOG.warning("[ALERT] Queue failed: %s" % e)
 
     async def _post_webhook(self, payload):
         try:
@@ -535,9 +531,8 @@ class AlertManager:
     async def alert_error(self, error):
         await self.send(AlertLevel.WARNING, "Engine Error", error)
 
-
 # =============================================================================
-# HEALTH HTTP SERVER with REAL-TIME CHART DASHBOARD
+# HEALTH HTTP SERVER with REAL-TIME CHART DASHBOARD + SLICERS
 # =============================================================================
 
 class HealthServer:
@@ -571,6 +566,9 @@ class HealthServer:
             elif path == "/status":
                 body = self._get_dashboard_html()
                 status = "200 OK"; ct = "text/html"
+            elif path == "/api/trades":
+                body = json.dumps(self._get_trade_data(), indent=2, default=str)
+                status = "200 OK"; ct = "application/json"
             else:
                 body = "Not Found"; status = "404 Not Found"; ct = "text/plain"
 
@@ -600,116 +598,432 @@ class HealthServer:
             "charts": self._engine_ref.metrics_history.get_chart_data()
         }
 
+    def _get_trade_data(self):
+        if self._engine_ref is None: return {"trades": []}
+        pnl = self._engine_ref.ledger.get_metrics()
+        return {"trades": pnl.get("trade_history", [])}
+
     def _get_dashboard_html(self):
         return r"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Arbitrage Engine v5.0 — Live Dashboard</title>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ARB v5.1 — Spatial Arbitrage Command Center</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'Segoe UI',monospace;background:#0a0a0a;color:#e0e0e0;overflow-x:hidden}
-header{background:#111;border-bottom:2px solid #0ff;padding:12px 24px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:100}
-header h1{color:#0ff;font-size:20px;letter-spacing:1px}
-header .status{display:flex;gap:16px;align-items:center;font-size:12px}
-header .status span{padding:4px 10px;border-radius:4px;font-weight:700}
-.status-closed{background:#0f0;color:#000}
-.status-open{background:#f00;color:#fff}
-.kpi-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;padding:16px 24px}
-.kpi-card{background:#111;border:1px solid #222;border-radius:8px;padding:16px;text-align:center;transition:border-color .3s}
-.kpi-card:hover{border-color:#0ff}
-.kpi-card h3{font-size:11px;color:#888;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}
-.kpi-card .value{font-size:28px;font-weight:700;color:#0f0}
-.kpi-card .value.red{color:#f00}
-.kpi-card .value.yellow{color:#ff0}
-.kpi-card .value.cyan{color:#0ff}
-.kpi-card .sub{font-size:11px;color:#666;margin-top:4px}
-.charts-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:16px;padding:0 24px 24px}
-.chart-card{background:#111;border:1px solid #222;border-radius:8px;padding:16px}
-.chart-card h3{font-size:13px;color:#0ff;margin-bottom:12px;text-transform:uppercase;letter-spacing:1px}
-.chart-container{position:relative;height:220px}
-.footer{text-align:center;padding:12px;color:#444;font-size:11px;border-top:1px solid #1a1a1a}
-#last-update{color:#666;font-size:11px}
-@media(max-width:900px){.charts-grid{grid-template-columns:1fr}}
-</style></head><body>
-<header><h1>SPATIAL ARBITRAGE ENGINE v5.0</h1><div class="status">
-<span id="circuit-badge" class="status-closed">CIRCUIT: CLOSED</span>
-<span id="uptime">UPTIME: 0s</span>
-<span id="last-update">Updating...</span>
-</div></header>
-<div class="kpi-row">
-<div class="kpi-card"><h3>Realized P&L</h3><div id="kpi-pnl" class="value cyan">$0.00</div><div class="sub">Total profit</div></div>
-<div class="kpi-card"><h3>Success Rate</h3><div id="kpi-rate" class="value">0.0%</div><div class="sub">Executed / Detected</div></div>
-<div class="kpi-card"><h3>Avg Exec Latency</h3><div id="kpi-lat" class="value yellow">0 us</div><div class="sub">p50 execution</div></div>
-<div class="kpi-card"><h3>Signals / Min</h3><div id="kpi-sig" class="value">0</div><div class="sub">Detection rate</div></div>
-<div class="kpi-card"><h3>Total Trades</h3><div id="kpi-trades" class="value">0</div><div class="sub">Completed</div></div>
-<div class="kpi-card"><h3>Binance Spread</h3><div id="kpi-bspr" class="value">0 bps</div><div class="sub">Top-of-book</div></div>
-</div>
-<div class="charts-grid">
-<div class="chart-card"><h3>P&L Over Time</h3><div class="chart-container"><canvas id="chart-pnl"></canvas></div></div>
-<div class="chart-card"><h3>Execution Latency (us)</h3><div class="chart-container"><canvas id="chart-latency"></canvas></div></div>
-<div class="chart-card"><h3>Signal Rate</h3><div class="chart-container"><canvas id="chart-signals"></canvas></div></div>
-<div class="chart-card"><h3>Exchange Spreads (bps)</h3><div class="chart-container"><canvas id="chart-spreads"></canvas></div></div>
-<div class="chart-card"><h3>Price Divergence</h3><div class="chart-container"><canvas id="chart-prices"></canvas></div></div>
-<div class="chart-card"><h3>Circuit Breaker State</h3><div class="chart-container"><canvas id="chart-circuit"></canvas></div></div>
-</div>
-<div class="footer">Spatial Arbitrage Engine v5.0 | Auto-refresh every 2s | <span id="footer-time"></span></div>
-<script>
-const chartColors={green:'#0f0',cyan:'#0ff',yellow:'#ff0',red:'#f00',purple:'#d0f',orange:'#fa0',gray:'#666'};
-const chartOpts={responsive:true,maintainAspectRatio:false,animation:{duration:400},plugins:{legend:{labels:{color:'#aaa',font:{size:11}}}},scales:{x:{ticks:{color:'#666',font:{size:10}},grid:{color:'#1a1a1a'}},y:{ticks:{color:'#666',font:{size:10}},grid:{color:'#1a1a1a'}}}};
-const mkChart=(id,type,labels,datasets)=>new Chart(document.getElementById(id),{type:type,data:{labels:labels,datasets:datasets},options:chartOpts});
-
-let cPnl=mkChart('chart-pnl','line',[],[{label:'Realized P&L ($)',data:[],borderColor:chartColors.cyan,backgroundColor:'rgba(0,255,255,0.1)',tension:0.3,fill:true,pointRadius:0}]);
-let cLat=mkChart('chart-latency','line',[],[{label:'p50',data:[],borderColor:chartColors.green,pointRadius:0},{label:'p99',data:[],borderColor:chartColors.red,pointRadius:0}]);
-let cSig=mkChart('chart-signals','line',[],[{label:'Detected',data:[],borderColor:chartColors.yellow,pointRadius:0},{label:'Executed',data:[],borderColor:chartColors.green,pointRadius:0}]);
-let cSpr=mkChart('chart-spreads','line',[],[{label:'Binance',data:[],borderColor:chartColors.cyan,pointRadius:0},{label:'Kraken',data:[],borderColor:chartColors.purple,pointRadius:0}]);
-let cPrice=mkChart('chart-prices','line',[],[{label:'Binance Mid',data:[],borderColor:chartColors.cyan,pointRadius:0},{label:'Kraken Mid',data:[],borderColor:chartColors.purple,pointRadius:0}]);
-let cCirc=mkChart('chart-circuit','line',[],[{label:'Closed=1, Open=0',data:[],borderColor:chartColors.green,backgroundColor:'rgba(0,255,0,0.1)',stepped:true,fill:true,pointRadius:0}]);
-
-async function update(){
-    try{
-        const r=await fetch('/metrics');
-        const d=await r.json();
-        const now=new Date().toLocaleTimeString();
-        document.getElementById('last-update').textContent='Updated: '+now;
-        document.getElementById('footer-time').textContent=now;
-
-        // KPIs
-        const pnl=parseFloat(d.pnl.total_realized_pnl)||0;
-        document.getElementById('kpi-pnl').textContent=(pnl>=0?'$':'-$')+Math.abs(pnl).toFixed(2);
-        document.getElementById('kpi-pnl').className='value '+(pnl>=0?'cyan':'red');
-        document.getElementById('kpi-rate').textContent=d.engine.success_rate+'%';
-        document.getElementById('kpi-lat').textContent=Math.round(d.latency.execution_us.p50||0)+' us';
-        const sigPerMin=Math.round((d.engine.signals_detected/(d.engine.uptime_sec/60))||0);
-        document.getElementById('kpi-sig').textContent=sigPerMin;
-        document.getElementById('kpi-trades').textContent=d.pnl.trade_count;
-        const bSpr=d.charts.binance_spread_bps.slice(-1)[0]||0;
-        document.getElementById('kpi-bspr').textContent=bSpr.toFixed(2)+' bps';
-
-        // Circuit badge
-        const cb=document.getElementById('circuit-badge');
-        cb.textContent='CIRCUIT: '+d.circuit.state;
-        cb.className=d.circuit.state==='CLOSED'?'status-closed':'status-open';
-        document.getElementById('uptime').textContent='UPTIME: '+Math.round(d.engine.uptime_sec)+'s';
-
-        // Charts
-        const ts=d.charts.timestamps;
-        cPnl.data.labels=ts; cPnl.data.datasets[0].data=d.charts.realized_pnl; cPnl.update('none');
-        cLat.data.labels=ts; cLat.data.datasets[0].data=d.charts.exec_latency_p50; cLat.data.datasets[1].data=d.charts.exec_latency_p99; cLat.update('none');
-        cSig.data.labels=ts; cSig.data.datasets[0].data=d.charts.signals_detected; cSig.data.datasets[1].data=d.charts.signals_executed; cSig.update('none');
-        cSpr.data.labels=ts; cSpr.data.datasets[0].data=d.charts.binance_spread_bps; cSpr.data.datasets[1].data=d.charts.kraken_spread_bps; cSpr.update('none');
-        cPrice.data.labels=ts; cPrice.data.datasets[0].data=d.charts.binance_mid; cPrice.data.datasets[1].data=d.charts.kraken_mid; cPrice.update('none');
-        cCirc.data.labels=ts; cCirc.data.datasets[0].data=d.charts.circuit_state; cCirc.update('none');
-    }catch(e){console.error('Update error:',e);}
+:root {
+  --bg: #0a0e17; --bg-card: rgba(16,22,40,0.85); --border: rgba(56,189,248,0.15);
+  --text: #e2e8f0; --text-dim: #94a3b8; --accent: #38bdf8; --accent2: #a78bfa;
+  --profit: #34d399; --loss: #f87171; --warn: #fbbf24; --glass: rgba(255,255,255,0.03);
 }
-update();
-setInterval(update,2000);
-</script></body></html>"""
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  min-height: 100vh;
+  background-image:
+    radial-gradient(circle at 10% 20%, rgba(56,189,248,0.08) 0%, transparent 40%),
+    radial-gradient(circle at 90% 80%, rgba(167,139,250,0.08) 0%, transparent 40%);
+}
+.header {
+  padding: 20px 30px;
+  border-bottom: 1px solid var(--border);
+  display: flex; justify-content: space-between; align-items: center;
+  background: var(--glass); backdrop-filter: blur(12px);
+}
+.header h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: -0.5px; }
+.header h1 span { color: var(--accent); }
+.badge {
+  padding: 6px 14px; border-radius: 20px; font-size: 0.75rem; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.5px;
+}
+.badge.closed { background: rgba(52,211,153,0.15); color: var(--profit); border: 1px solid rgba(52,211,153,0.3); }
+.badge.open { background: rgba(248,113,113,0.15); color: var(--loss); border: 1px solid rgba(248,113,113,0.3); }
+
+.slicer-panel {
+  margin: 20px 30px;
+  padding: 18px 24px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  backdrop-filter: blur(12px);
+  display: flex; flex-wrap: wrap; gap: 16px; align-items: center;
+}
+.slicer-group { display: flex; flex-direction: column; gap: 6px; }
+.slicer-group label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); font-weight: 600; }
+.slicer-group select, .slicer-group input {
+  background: var(--glass); border: 1px solid var(--border); color: var(--text);
+  padding: 8px 14px; border-radius: 10px; font-size: 0.85rem; outline: none;
+  min-width: 140px; cursor: pointer; transition: all 0.2s;
+}
+.slicer-group select:hover, .slicer-group input:hover { border-color: var(--accent); }
+.slicer-group select:focus, .slicer-group input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(56,189,248,0.1); }
+.slicer-btn {
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  border: none; color: #fff; padding: 10px 22px; border-radius: 10px;
+  font-weight: 600; font-size: 0.85rem; cursor: pointer; transition: all 0.2s;
+  margin-left: auto; align-self: flex-end;
+}
+.slicer-btn:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(56,189,248,0.25); }
+
+.kpi-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 16px; margin: 0 30px 20px;
+}
+.kpi-card {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 16px;
+  padding: 20px; backdrop-filter: blur(12px); transition: all 0.3s;
+}
+.kpi-card:hover { border-color: rgba(56,189,248,0.3); transform: translateY(-2px); }
+.kpi-card .kpi-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 8px; }
+.kpi-card .kpi-value { font-size: 1.6rem; font-weight: 700; }
+.kpi-card .kpi-sub { font-size: 0.8rem; color: var(--text-dim); margin-top: 4px; }
+.kpi-profit { color: var(--profit); }
+.kpi-loss { color: var(--loss); }
+
+.chart-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+  gap: 16px; margin: 0 30px 20px;
+}
+.chart-card {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 16px;
+  padding: 20px; backdrop-filter: blur(12px);
+}
+.chart-card h3 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 14px; }
+.chart-wrapper { position: relative; height: 260px; }
+
+.trade-panel {
+  margin: 0 30px 30px;
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 16px;
+  padding: 20px; backdrop-filter: blur(12px);
+}
+.trade-panel h3 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 14px; }
+.trade-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+.trade-table th { text-align: left; padding: 10px 12px; color: var(--text-dim); font-weight: 600; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); }
+.trade-table td { padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,0.03); }
+.trade-table tr:hover { background: var(--glass); }
+.status-filled { color: var(--profit); font-weight: 600; }
+.status-failed { color: var(--loss); font-weight: 600; }
+.status-partial { color: var(--warn); font-weight: 600; }
+
+.footer {
+  text-align: center; padding: 20px; color: var(--text-dim); font-size: 0.75rem;
+  border-top: 1px solid var(--border);
+}
+
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+.live-dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--profit); margin-right:8px; animation:pulse 2s infinite; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <h1><span>ARB</span> v5.1 &mdash; Spatial Arbitrage Command Center</h1>
+    <div style="margin-top:6px;font-size:0.8rem;color:var(--text-dim);">
+      <span class="live-dot"></span>Live | <span id="uptime">0s</span> | Auto-refresh: <span id="refreshLabel">2s</span>
+    </div>
+  </div>
+  <div class="badge closed" id="circuitBadge">CIRCUIT: CLOSED</div>
+</div>
+
+<!-- SLICERS -->
+<div class="slicer-panel">
+  <div class="slicer-group">
+    <label>Time Range</label>
+    <select id="timeSlicer">
+      <option value="all">All Time</option>
+      <option value="60">Last 1 Minute</option>
+      <option value="300">Last 5 Minutes</option>
+      <option value="900" selected>Last 15 Minutes</option>
+      <option value="3600">Last 1 Hour</option>
+    </select>
+  </div>
+  <div class="slicer-group">
+    <label>Min Profit ($)</label>
+    <input type="number" id="profitSlicer" value="0" min="0" step="0.01" placeholder="0.00">
+  </div>
+  <div class="slicer-group">
+    <label>Exchange Pair</label>
+    <select id="pairSlicer">
+      <option value="all">All Pairs</option>
+      <option value="binance_kraken">Binance &rarr; Kraken</option>
+      <option value="kraken_binance">Kraken &rarr; Binance</option>
+    </select>
+  </div>
+  <div class="slicer-group">
+    <label>Status Filter</label>
+    <select id="statusSlicer">
+      <option value="all">All Statuses</option>
+      <option value="FILLED">FILLED</option>
+      <option value="FAILED">FAILED</option>
+      <option value="PARTIAL">PARTIAL</option>
+    </select>
+  </div>
+  <div class="slicer-group">
+    <label>Refresh Rate</label>
+    <select id="refreshSlicer">
+      <option value="1000">1 second</option>
+      <option value="2000" selected>2 seconds</option>
+      <option value="5000">5 seconds</option>
+      <option value="10000">10 seconds</option>
+    </select>
+  </div>
+  <button class="slicer-btn" onclick="applySlicers()">Apply Filters</button>
+</div>
+
+<!-- KPI CARDS -->
+<div class="kpi-grid">
+  <div class="kpi-card">
+    <div class="kpi-label">Realized P&amp;L</div>
+    <div class="kpi-value" id="kpiPnl">$0.00</div>
+    <div class="kpi-sub" id="kpiPnlSub">Total profit</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">Success Rate</div>
+    <div class="kpi-value" id="kpiRate">0.0%</div>
+    <div class="kpi-sub" id="kpiRateSub">Executed / Detected</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">Avg Exec Latency</div>
+    <div class="kpi-value" id="kpiLat">0 &mu;s</div>
+    <div class="kpi-sub" id="kpiLatSub">p50 execution</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">Signals / Min</div>
+    <div class="kpi-value" id="kpiSig">0</div>
+    <div class="kpi-sub" id="kpiSigSub">Detection rate</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">Total Trades</div>
+    <div class="kpi-value" id="kpiTrades">0</div>
+    <div class="kpi-sub" id="kpiTradesSub">Completed</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">Binance Spread</div>
+    <div class="kpi-value" id="kpiSpread">0 bps</div>
+    <div class="kpi-sub" id="kpiSpreadSub">Top-of-book</div>
+  </div>
+</div>
+
+<!-- CHARTS -->
+<div class="chart-grid">
+  <div class="chart-card">
+    <h3>P&amp;L Over Time</h3>
+    <div class="chart-wrapper"><canvas id="pnlChart"></canvas></div>
+  </div>
+  <div class="chart-card">
+    <h3>Execution Latency (&mu;s)</h3>
+    <div class="chart-wrapper"><canvas id="latChart"></canvas></div>
+  </div>
+  <div class="chart-card">
+    <h3>Signal Rate</h3>
+    <div class="chart-wrapper"><canvas id="sigChart"></canvas></div>
+  </div>
+  <div class="chart-card">
+    <h3>Exchange Spreads (bps)</h3>
+    <div class="chart-wrapper"><canvas id="spreadChart"></canvas></div>
+  </div>
+  <div class="chart-card">
+    <h3>Price Divergence</h3>
+    <div class="chart-wrapper"><canvas id="priceChart"></canvas></div>
+  </div>
+  <div class="chart-card">
+    <h3>Circuit Breaker State</h3>
+    <div class="chart-wrapper"><canvas id="circuitChart"></canvas></div>
+  </div>
+</div>
+
+<!-- TRADE LOG -->
+<div class="trade-panel">
+  <h3>Trade Log <span style="float:right;font-weight:400;color:var(--text-dim);font-size:0.75rem;" id="tradeCount">0 trades</span></h3>
+  <div style="overflow-x:auto;">
+    <table class="trade-table">
+      <thead>
+        <tr><th>Time</th><th>ID</th><th>Buy</th><th>Sell</th><th>Buy VWAP</th><th>Sell VWAP</th><th>Volume</th><th>Net Profit</th><th>Latency</th><th>Status</th></tr>
+      </thead>
+      <tbody id="tradeBody">
+        <tr><td colspan="10" style="text-align:center;color:var(--text-dim);">No trades yet...</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="footer">Spatial Arbitrage Engine v5.1 | Zero-Gap Architecture | Built for Profit</div>
+
+<script>
+// ===================== CHART SETUP =====================
+const chartConfig = (label, color, fill=false) => ({
+  type: 'line',
+  data: { labels: [], datasets: [{ label, data: [], borderColor: color, backgroundColor: color+'20', borderWidth: 2, pointRadius: 0, tension: 0.4, fill }] },
+  options: {
+    responsive: true, maintainAspectRatio: false,
+    plugins: { legend: { display: false } },
+    scales: {
+      x: { grid: { color: 'rgba(255,255,255,0.03)' }, ticks: { color: '#64748b', font: {size:10} } },
+      y: { grid: { color: 'rgba(255,255,255,0.03)' }, ticks: { color: '#64748b', font: {size:10} } }
+    },
+    animation: { duration: 300 }
+  }
+});
+
+const pnlChart = new Chart(document.getElementById('pnlChart'), chartConfig('Realized P&L', '#34d399', true));
+const latChart = new Chart(document.getElementById('latChart'), chartConfig('Latency', '#a78bfa'));
+latChart.data.datasets.push({ label: 'p99', data: [], borderColor: '#f87171', borderWidth: 1, pointRadius: 0, tension: 0.4 });
+const sigChart = new Chart(document.getElementById('sigChart'), chartConfig('Detected', '#38bdf8', true));
+sigChart.data.datasets.push({ label: 'Executed', data: [], borderColor: '#34d399', backgroundColor: '#34d39920', borderWidth: 2, pointRadius: 0, tension: 0.4, fill: true });
+const spreadChart = new Chart(document.getElementById('spreadChart'), chartConfig('Binance', '#38bdf8'));
+spreadChart.data.datasets.push({ label: 'Kraken', data: [], borderColor: '#a78bfa', borderWidth: 2, pointRadius: 0, tension: 0.4 });
+const priceChart = new Chart(document.getElementById('priceChart'), chartConfig('Binance', '#38bdf8'));
+priceChart.data.datasets.push({ label: 'Kraken', data: [], borderColor: '#a78bfa', borderWidth: 2, pointRadius: 0, tension: 0.4 });
+const circuitChart = new Chart(document.getElementById('circuitChart'), {
+  type: 'line',
+  data: { labels: [], datasets: [{ label: 'Circuit', data: [], borderColor: '#fbbf24', backgroundColor: '#fbbf2420', borderWidth: 2, pointRadius: 0, tension: 0, fill: true, stepped: true }] },
+  options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { grid: { color: 'rgba(255,255,255,0.03)' }, ticks: { color: '#64748b', font: {size:10} } }, y: { min: 0, max: 1.2, grid: { color: 'rgba(255,255,255,0.03)' }, ticks: { color: '#64748b', font: {size:10}, callback: v => v===1?'CLOSED':'OPEN' } } }, animation: { duration: 300 } }
+});
+
+// ===================== STATE =====================
+let allData = { timestamps: [], realized_pnl: [], exec_latency_p50: [], exec_latency_p99: [], detection_latency_avg: [], signals_detected: [], signals_executed: [], binance_spread_bps: [], kraken_spread_bps: [], binance_mid: [], kraken_mid: [], circuit_state: [] };
+let allTrades = [];
+let refreshInterval = 2000;
+let timer = null;
+let startTime = Date.now();
+
+// ===================== SLICER LOGIC =====================
+function applySlicers() {
+  const timeVal = document.getElementById('timeSlicer').value;
+  const minProfit = parseFloat(document.getElementById('profitSlicer').value) || 0;
+  const pairVal = document.getElementById('pairSlicer').value;
+  const statusVal = document.getElementById('statusSlicer').value;
+  const refreshVal = parseInt(document.getElementById('refreshSlicer').value);
+
+  refreshInterval = refreshVal;
+  document.getElementById('refreshLabel').textContent = (refreshVal/1000) + 's';
+  clearInterval(timer);
+  timer = setInterval(fetchData, refreshInterval);
+
+  // Filter trades
+  let filtered = allTrades.filter(t => {
+    const profit = parseFloat(t.net_profit || 0);
+    if (profit < minProfit) return false;
+    if (pairVal !== 'all') {
+      const pair = t.buy_exchange + '_' + t.sell_exchange;
+      if (pair !== pairVal) return false;
+    }
+    if (statusVal !== 'all' && t.status !== statusVal) return false;
+    return true;
+  });
+
+  renderTrades(filtered);
+
+  // Filter chart data by time range
+  let sliceCount = allData.timestamps.length;
+  if (timeVal !== 'all') {
+    const secs = parseInt(timeVal);
+    const points = Math.min(Math.ceil(secs / 2), allData.timestamps.length);
+    sliceCount = points;
+  }
+  const s = allData.timestamps.length - sliceCount;
+  const e = allData.timestamps.length;
+
+  updateChart(pnlChart, allData.timestamps.slice(s,e), [allData.realized_pnl.slice(s,e)]);
+  updateChart(latChart, allData.timestamps.slice(s,e), [allData.exec_latency_p50.slice(s,e), allData.exec_latency_p99.slice(s,e)]);
+  updateChart(sigChart, allData.timestamps.slice(s,e), [allData.signals_detected.slice(s,e), allData.signals_executed.slice(s,e)]);
+  updateChart(spreadChart, allData.timestamps.slice(s,e), [allData.binance_spread_bps.slice(s,e), allData.kraken_spread_bps.slice(s,e)]);
+  updateChart(priceChart, allData.timestamps.slice(s,e), [allData.binance_mid.slice(s,e), allData.kraken_mid.slice(s,e)]);
+  updateChart(circuitChart, allData.timestamps.slice(s,e), [allData.circuit_state.slice(s,e)]);
+}
+
+function updateChart(chart, labels, datasets) {
+  chart.data.labels = labels;
+  datasets.forEach((d, i) => { if (chart.data.datasets[i]) chart.data.datasets[i].data = d; });
+  chart.update('none');
+}
+
+function renderTrades(trades) {
+  const tbody = document.getElementById('tradeBody');
+  document.getElementById('tradeCount').textContent = trades.length + ' trades';
+  if (!trades.length) {
+    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--text-dim);">No trades match filters...</td></tr>';
+    return;
+  }
+  tbody.innerHTML = trades.slice(0, 50).map(t => {
+    const profit = parseFloat(t.net_profit || 0);
+    const profitClass = profit >= 0 ? 'kpi-profit' : 'kpi-loss';
+    const statusClass = t.status === 'FILLED' ? 'status-filled' : t.status === 'FAILED' ? 'status-failed' : 'status-partial';
+    return `<tr>
+      <td>${t.timestamp ? t.timestamp.split('T')[1].split('.')[0] : '-'}</td>
+      <td>${t.execution_id?.slice(-8) || '-'}</td>
+      <td>${t.buy_exchange || '-'}</td>
+      <td>${t.sell_exchange || '-'}</td>
+      <td>$${t.buy_vwap || '0'}</td>
+      <td>$${t.sell_vwap || '0'}</td>
+      <td>${t.target_volume || '0'} BTC</td>
+      <td class="${profitClass}">$${profit.toFixed(2)}</td>
+      <td>${t.latency_us || 0} &mu;s</td>
+      <td class="${statusClass}">${t.status || '-'}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ===================== FETCH =====================
+async function fetchData() {
+  try {
+    const [mRes, tRes] = await Promise.all([fetch('/metrics'), fetch('/api/trades')]);
+    const m = await mRes.json();
+    const t = await tRes.json();
+
+    // Update KPIs
+    const pnl = parseFloat(m.pnl?.total_realized_pnl || 0);
+    document.getElementById('kpiPnl').textContent = (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2);
+    document.getElementById('kpiPnl').className = 'kpi-value ' + (pnl >= 0 ? 'kpi-profit' : 'kpi-loss');
+
+    const rate = m.engine?.success_rate || 0;
+    document.getElementById('kpiRate').textContent = rate.toFixed(1) + '%';
+    document.getElementById('kpiRateSub').textContent = (m.engine?.signals_executed || 0) + ' / ' + (m.engine?.signals_detected || 0);
+
+    const lat = m.latency?.execution_us?.p50 || 0;
+    document.getElementById('kpiLat').textContent = Math.round(lat) + ' μs';
+
+    const sigMin = m.engine?.signals_detected ? Math.round(m.engine.signals_detected / Math.max(m.engine.uptime_sec/60, 1)) : 0;
+    document.getElementById('kpiSig').textContent = sigMin;
+
+    document.getElementById('kpiTrades').textContent = m.pnl?.trade_count || 0;
+
+    const bSpread = m.charts?.binance_spread_bps?.slice(-1)[0] || 0;
+    document.getElementById('kpiSpread').textContent = bSpread.toFixed(2) + ' bps';
+
+    // Circuit badge
+    const circ = m.circuit?.state || 'CLOSED';
+    const badge = document.getElementById('circuitBadge');
+    badge.textContent = 'CIRCUIT: ' + circ;
+    badge.className = 'badge ' + (circ === 'CLOSED' ? 'closed' : 'open');
+
+    // Uptime
+    const up = Math.floor(m.engine?.uptime_sec || 0);
+    document.getElementById('uptime').textContent = Math.floor(up/60) + 'm ' + (up%60) + 's';
+
+    // Store all data
+    allData = m.charts;
+    allTrades = t.trades || [];
+
+    applySlicers();
+  } catch (e) { console.error('Fetch error:', e); }
+}
+
+// ===================== INIT =====================
+timer = setInterval(fetchData, refreshInterval);
+fetchData();
+</script>
+</body>
+</html>"""
 
     async def shutdown(self):
         if self._server:
             self._server.close(); await self._server.wait_closed()
-            LOG.info("[HEALTH] Shutdown.")
-
+        LOG.info("[HEALTH] Shutdown.")
 
 # =============================================================================
 # EXCHANGE WEBSOCKET MANAGER (LIVE)
@@ -734,7 +1048,7 @@ class ExchangeWebSocketManager:
         exchange_class = getattr(ccxtpro, self.exchange_id.value, None)
         if exchange_class is None: raise RuntimeError("Exchange %s not supported" % self.exchange_id.value)
         instance = exchange_class({'apiKey': self.config.api_key, 'secret': self.config.api_secret,
-                                    'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
+                                   'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
         if self.config.sandbox:
             try: instance.set_sandbox_mode(True)
             except Exception as e: LOG.warning("[%s] Sandbox unavailable: %s" % (self.exchange_id.value, e))
@@ -756,7 +1070,7 @@ class ExchangeWebSocketManager:
                 if self._exchange:
                     try: await self._exchange.close()
                     except: pass
-                    self._exchange = None
+                self._exchange = None
                 try: await asyncio.wait_for(self._shutdown_event.wait(), timeout=delay_ms / 1000.0)
                 except asyncio.TimeoutError: pass
 
@@ -847,7 +1161,7 @@ class SyntheticExchangeManager:
         asks.sort(key=lambda x: x.price)
         async with self._lock:
             self._order_book = OrderBookSnapshot(self.exchange_id, self.symbol, now_ns, bids, asks)
-        self._messages_received += 1
+            self._messages_received += 1
 
     async def get_order_book(self):
         async with self._lock: return self._order_book
@@ -941,7 +1255,6 @@ class ExecutionRouter:
         else:
             return await exchange.create_order(symbol=symbol, type='market', side=side.value, amount=float(volume))
 
-
 # =============================================================================
 # MICROSECOND PERSISTENCE LAYER
 # =============================================================================
@@ -958,20 +1271,20 @@ class DataSink:
             self._cursor.execute("PRAGMA journal_mode=WAL;")
             self._cursor.execute("PRAGMA synchronous=NORMAL;")
             self._cursor.execute("PRAGMA temp_store=MEMORY;")
-        self._cursor.execute("""
-            CREATE TABLE IF NOT EXISTS arbitrage_signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp_ns INTEGER NOT NULL,
-                received_at TEXT NOT NULL, symbol TEXT NOT NULL, buy_exchange TEXT NOT NULL,
-                sell_exchange TEXT NOT NULL, buy_vwap TEXT NOT NULL, sell_vwap TEXT NOT NULL,
-                target_volume TEXT NOT NULL, gross_spread TEXT NOT NULL, buy_fee TEXT NOT NULL,
-                sell_fee TEXT NOT NULL, gas_fee TEXT NOT NULL, net_profit TEXT NOT NULL,
-                net_profit_pct TEXT NOT NULL, execution_id TEXT UNIQUE NOT NULL,
-                executed INTEGER DEFAULT 0, execution_latency_us INTEGER, status TEXT)
-        """)
-        self._cursor.execute("CREATE INDEX IF NOT EXISTS idx_ts ON arbitrage_signals(timestamp_ns)")
-        self._cursor.execute("CREATE INDEX IF NOT EXISTS idx_exec ON arbitrage_signals(execution_id)")
-        self._conn.commit()
-        LOG.info("[DATASINK] SQLite at '%s'." % self.db_path)
+            self._cursor.execute("""
+                CREATE TABLE IF NOT EXISTS arbitrage_signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp_ns INTEGER NOT NULL,
+                    received_at TEXT NOT NULL, symbol TEXT NOT NULL, buy_exchange TEXT NOT NULL,
+                    sell_exchange TEXT NOT NULL, buy_vwap TEXT NOT NULL, sell_vwap TEXT NOT NULL,
+                    target_volume TEXT NOT NULL, gross_spread TEXT NOT NULL, buy_fee TEXT NOT NULL,
+                    sell_fee TEXT NOT NULL, gas_fee TEXT NOT NULL, net_profit TEXT NOT NULL,
+                    net_profit_pct TEXT NOT NULL, execution_id TEXT UNIQUE NOT NULL,
+                    executed INTEGER DEFAULT 0, execution_latency_us INTEGER, status TEXT)
+            """)
+            self._cursor.execute("CREATE INDEX IF NOT EXISTS idx_ts ON arbitrage_signals(timestamp_ns)")
+            self._cursor.execute("CREATE INDEX IF NOT EXISTS idx_exec ON arbitrage_signals(execution_id)")
+            self._conn.commit()
+            LOG.info("[DATASINK] SQLite at '%s'." % self.db_path)
 
     def persist_signal(self, signal):
         if self._cursor is None: raise RuntimeError("Not initialized")
@@ -1078,7 +1391,7 @@ class ArbitrageEngine:
 
     async def start(self):
         LOG.info("=" * 70)
-        LOG.info("ARBITRAGE ENGINE v5.0 | Mode: %s" % ("DEMO" if self.demo_mode else "LIVE"))
+        LOG.info("ARBITRAGE ENGINE v5.1 | Mode: %s" % ("DEMO" if self.demo_mode else "LIVE"))
         LOG.info("Symbol: %s | Vol: %s | Threshold: %s" % (self.config.symbol, self.config.target_volume, self.config.min_yield_threshold))
         LOG.info("Risk: max_trades=%d | max_loss=%s | cooldown=%ds" % (
             self.risk_config.max_daily_trades, self.risk_config.max_daily_loss, self.risk_config.cooldown_seconds_after_failure))
@@ -1151,7 +1464,7 @@ class ArbitrageEngine:
         self._signals_detected += 1
         self.data_sink.persist_signal(signal)
         LOG.info("[SIGNAL] #%d | %s | Net: %s %s" % (self._signals_detected, signal.execution_id,
-                                                     signal.net_profit, signal.symbol.split('/')[1]))
+                                                      signal.net_profit, signal.symbol.split('/')[1]))
         try:
             result = await self.execution_router.execute_arbitrage(signal, self.exchanges)
             await self.latency_tracker.record_execution(result.latency_us)
@@ -1209,7 +1522,6 @@ class ArbitrageEngine:
         await self.health_server.shutdown()
         LOG.info("[ENGINE] Done.")
 
-
 # =============================================================================
 # SIGNAL HANDLERS & MAIN
 # =============================================================================
@@ -1236,7 +1548,7 @@ class SignalHandler:
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Spatial Arbitrage Engine v5.0")
+    parser = argparse.ArgumentParser(description="Spatial Arbitrage Engine v5.1")
     parser.add_argument("--live", action="store_true", help="LIVE mode (needs API keys)")
     parser.add_argument("--duration", type=int, default=120, help="Demo duration in seconds")
     parser.add_argument("--db", default="arbitrage_engine.db", help="SQLite path")

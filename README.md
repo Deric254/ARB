@@ -1,4 +1,4 @@
-# Spatial Arbitrage Engine v5.0
+# Spatial Arbitrage Engine v5.1
 
 ## WINDOWS - Quick Start
 
@@ -17,6 +17,7 @@
 Auto-opens at: **http://localhost:8080/status**
 
 Features:
+- **5 INTERACTIVE SLICERS** — Time Range, Min Profit, Exchange Pair, Status, Refresh Rate
 - **6 live charts** auto-refreshing every 2 seconds
 - **KPI cards**: P&L, Success Rate, Latency, Signals/min, Trades, Spread
 - **P&L Over Time** — cumulative profit line chart
@@ -25,13 +26,14 @@ Features:
 - **Exchange Spreads** — Binance vs Kraken bid-ask spread (bps)
 - **Price Divergence** — mid-price of both exchanges
 - **Circuit Breaker State** — closed/open status over time
+- **Trade Log Table** — live-filtered trade history
 
 ## Where to Get API Keys
 
 | Exchange | URL |
 |----------|-----|
-| Binance  | https://www.binance.com/en/my/settings/api-management |
-| Kraken   | https://www.kraken.com/u/security/api |
+| Binance | https://www.binance.com/en/my/settings/api-management |
+| Kraken | https://www.kraken.com/u/security/api |
 
 Enable: **Spot Trading** only (never withdrawals)
 
