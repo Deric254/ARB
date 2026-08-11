@@ -6,6 +6,8 @@ echo   SPATIAL ARBITRAGE ENGINE v4.0
 echo   LIVE MODE - REAL CAPITAL AT RISK
 echo ==========================================
 echo.
+
+REM Check API keys
 if "%BINANCE_API_KEY%"=="" goto MISSING
 if "%BINANCE_API_SECRET%"=="" goto MISSING
 if "%KRAKEN_API_KEY%"=="" goto MISSING
@@ -49,9 +51,14 @@ if errorlevel 1 (
 if errorlevel 1 %PYTHON_CMD% -m pip install -r requirements.txt
 
 echo [OK] Starting LIVE mode...
-echo [INFO] Dashboard: http://localhost:8080/status
+echo [INFO] Dashboard will open automatically in 3 seconds.
+echo [INFO] Press Ctrl+C to stop.
 echo [WARN] Sandbox safety is ON by default.
 echo.
+
+REM Auto-open browser after 3 seconds
+start /B "" %PYTHON_CMD% -c "import time, os; time.sleep(3); os.system('start http://localhost:8080/status')"
+
 %PYTHON_CMD% arbitrage_engine.py --live --port 8080
 
 echo.

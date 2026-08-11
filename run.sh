@@ -13,6 +13,7 @@ if ! python3 -c "import ccxt, aiofiles" 2>/dev/null; then
 fi
 MODE="${1:-demo}"
 PORT="${2:-8080}"
+URL="http://localhost:$PORT/status"
 if [ "$MODE" == "live" ]; then
     if [ -z "$BINANCE_API_KEY" ] || [ -z "$KRAKEN_API_KEY" ]; then
         echo "[ERROR] Set BINANCE_API_KEY and KRAKEN_API_KEY"
@@ -21,8 +22,11 @@ if [ "$MODE" == "live" ]; then
         exit 1
     fi
     echo "[MODE] LIVE"
+    (sleep 3 && xdg-open "$URL" 2>/dev/null || open "$URL" 2>/dev/null || echo "[INFO] Open $URL manually") &
     python3 arbitrage_engine.py --live --port "$PORT"
 else
-    echo "[MODE] DEMO - http://localhost:$PORT/status"
+    echo "[MODE] DEMO"
+    echo "[INFO] Opening $URL in 3 seconds..."
+    (sleep 3 && xdg-open "$URL" 2>/dev/null || open "$URL" 2>/dev/null || echo "[INFO] Open $URL manually") &
     python3 arbitrage_engine.py --duration 120 --port "$PORT"
 fi
