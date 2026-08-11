@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 echo "=========================================="
-echo "  SPATIAL ARBITRAGE ENGINE v4.0"
+echo "  SPATIAL ARBITRAGE ENGINE v5.0"
 echo "=========================================="
 if ! command -v python3 &>/dev/null; then
     echo "[ERROR] python3 not found. Install Python 3.9+"
@@ -22,11 +22,11 @@ if [ "$MODE" == "live" ]; then
         exit 1
     fi
     echo "[MODE] LIVE"
-    (sleep 3 && xdg-open "$URL" 2>/dev/null || open "$URL" 2>/dev/null || echo "[INFO] Open $URL manually") &
+    (sleep 4 && xdg-open "$URL" 2>/dev/null || open "$URL" 2>/dev/null || echo "[INFO] Open $URL manually") &
     python3 arbitrage_engine.py --live --port "$PORT"
 else
     echo "[MODE] DEMO"
-    echo "[INFO] Opening $URL in 3 seconds..."
-    (sleep 3 && xdg-open "$URL" 2>/dev/null || open "$URL" 2>/dev/null || echo "[INFO] Open $URL manually") &
+    echo "[INFO] Opening $URL in 4 seconds..."
+    (sleep 4 && xdg-open "$URL" 2>/dev/null || open "$URL" 2>/dev/null || echo "[INFO] Open $URL manually") &
     python3 arbitrage_engine.py --duration 120 --port "$PORT"
 fi

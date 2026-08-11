@@ -1,11 +1,11 @@
-# Spatial Arbitrage Engine v4.0
+# Spatial Arbitrage Engine v5.0
 
 ## WINDOWS - Quick Start
 
-### DEMO (No API keys)
+### DEMO (No API keys, auto-opens browser)
 1. Extract ZIP to a folder
 2. Double-click **RUN_DEMO.bat**
-3. Your browser will **open automatically** to the dashboard
+3. Your browser opens automatically to the live dashboard
 
 ### LIVE (Real exchanges)
 1. Get API keys from Binance and Kraken
@@ -14,12 +14,17 @@
 
 ## Dashboard
 
-While the engine runs, your browser opens to:
-- **http://localhost:8080/status** — Live HTML dashboard with P&L, latency, circuit breaker status
-- **http://localhost:8080/metrics** — JSON telemetry
-- **http://localhost:8080/health** — Liveness probe
+Auto-opens at: **http://localhost:8080/status**
 
-If the browser doesn't open automatically, manually navigate to `http://localhost:8080/status`
+Features:
+- **6 live charts** auto-refreshing every 2 seconds
+- **KPI cards**: P&L, Success Rate, Latency, Signals/min, Trades, Spread
+- **P&L Over Time** — cumulative profit line chart
+- **Execution Latency** — p50 and p99 trend lines
+- **Signal Rate** — detected vs executed over time
+- **Exchange Spreads** — Binance vs Kraken bid-ask spread (bps)
+- **Price Divergence** — mid-price of both exchanges
+- **Circuit Breaker State** — closed/open status over time
 
 ## Where to Get API Keys
 
@@ -32,9 +37,8 @@ Enable: **Spot Trading** only (never withdrawals)
 
 ## Output Files
 
-Created in the same folder as the engine:
-- `arbitrage_signals.csv` — Trade history for Excel/Tableau/Power BI
-- `arbitrage_engine.db` — SQLite database with full records
+- `arbitrage_signals.csv` — Trade history for Excel/Tableau
+- `arbitrage_engine.db` — SQLite database
 
 ## Requirements
 
