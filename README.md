@@ -1,6 +1,6 @@
-# Spatial Arbitrage Engine v5.1
+# Spatial Arbitrage Engine v5.2
 
-## WINDOWS - Quick Start
+## WINDOWS — Quick Start
 
 ### DEMO (No API keys, auto-opens browser)
 1. Extract ZIP to a folder
@@ -16,9 +16,16 @@
 
 Auto-opens at: **http://localhost:8080/status**
 
-Features:
+### v5.2 Fixes
+- Charts no longer flicker or reset on every update
+- Slicers persist values and filter correctly
+- Trade log shows real data with proper color coding
+- Smooth animations and responsive updates
+- Circuit breaker badge updates correctly
+
+### Features
 - **5 INTERACTIVE SLICERS** — Time Range, Min Profit, Exchange Pair, Status, Refresh Rate
-- **6 live charts** auto-refreshing every 2 seconds
+- **6 live charts** auto-refreshing
 - **KPI cards**: P&L, Success Rate, Latency, Signals/min, Trades, Spread
 - **P&L Over Time** — cumulative profit line chart
 - **Execution Latency** — p50 and p99 trend lines

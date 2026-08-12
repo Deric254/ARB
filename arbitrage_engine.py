@@ -535,6 +535,11 @@ class AlertManager:
 # HEALTH HTTP SERVER with REAL-TIME CHART DASHBOARD + SLICERS
 # =============================================================================
 
+
+# =============================================================================
+# HEALTH HTTP SERVER with REAL-TIME CHART DASHBOARD + SLICERS (v5.2 FIXED)
+# =============================================================================
+
 class HealthServer:
     def __init__(self, port=8080):
         self.port = port
@@ -553,53 +558,76 @@ class HealthServer:
     async def _handle_request(self, reader, writer):
         try:
             request_line = (await reader.readline()).decode('utf-8').strip()
-            if not request_line: writer.close(); await writer.wait_closed(); return
+            if not request_line:
+                writer.close()
+                await writer.wait_closed()
+                return
             parts = request_line.split()
             path = parts[1] if len(parts) > 1 else "/"
 
             if path == "/health":
                 body = json.dumps({"status": "ok", "timestamp": time.time_ns()})
-                status = "200 OK"; ct = "application/json"
+                status = "200 OK"
+                ct = "application/json"
             elif path == "/metrics":
                 body = json.dumps(self._get_metrics(), indent=2, default=str)
-                status = "200 OK"; ct = "application/json"
+                status = "200 OK"
+                ct = "application/json"
             elif path == "/status":
                 body = self._get_dashboard_html()
-                status = "200 OK"; ct = "text/html"
+                status = "200 OK"
+                ct = "text/html"
             elif path == "/api/trades":
                 body = json.dumps(self._get_trade_data(), indent=2, default=str)
-                status = "200 OK"; ct = "application/json"
+                status = "200 OK"
+                ct = "application/json"
             else:
-                body = "Not Found"; status = "404 Not Found"; ct = "text/plain"
+                body = "Not Found"
+                status = "404 Not Found"
+                ct = "text/plain"
 
-            response = "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" % (
-                status, ct, len(body.encode('utf-8')), body)
+            response = (
+                "HTTP/1.1 %s\r\n"
+                "Content-Type: %s\r\n"
+                "Content-Length: %d\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "%s"
+            ) % (status, ct, len(body.encode('utf-8')), body)
             writer.write(response.encode('utf-8'))
             await writer.drain()
         except Exception as e:
             LOG.warning("[HEALTH] Error: %s" % e)
         finally:
-            writer.close(); await writer.wait_closed()
+            writer.close()
+            await writer.wait_closed()
 
     def _get_metrics(self):
-        if self._engine_ref is None: return {"error": "No engine"}
+        if self._engine_ref is None:
+            return {"error": "No engine"}
         return {
             "engine": {
                 "signals_detected": self._engine_ref._signals_detected,
                 "signals_executed": self._engine_ref._signals_executed,
-                "success_rate": round(self._engine_ref._signals_executed / max(self._engine_ref._signals_detected, 1) * 100, 2),
+                "success_rate": round(
+                    self._engine_ref._signals_executed
+                    / max(self._engine_ref._signals_detected, 1) * 100, 2
+                ),
                 "uptime_sec": (time.time_ns() - self._engine_ref._start_time_ns) / 1e9,
             },
             "circuit": self._engine_ref.circuit_breaker.get_metrics(),
             "latency": self._engine_ref.latency_tracker.get_metrics(),
             "pnl": self._engine_ref.ledger.get_metrics(),
-            "exchanges": {ex_id.value: {"connected": m.is_connected, "msgs": m.messages_received}
-                          for ex_id, m in self._engine_ref.exchanges.items()},
+            "exchanges": {
+                ex_id.value: {"connected": m.is_connected, "msgs": m.messages_received}
+                for ex_id, m in self._engine_ref.exchanges.items()
+            },
             "charts": self._engine_ref.metrics_history.get_chart_data()
         }
 
     def _get_trade_data(self):
-        if self._engine_ref is None: return {"trades": []}
+        if self._engine_ref is None:
+            return {"trades": []}
         pnl = self._engine_ref.ledger.get_metrics()
         return {"trades": pnl.get("trade_history", [])}
 
@@ -609,121 +637,115 @@ class HealthServer:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ARB v5.1 — Spatial Arbitrage Command Center</title>
+<title>ARB v5.2 — Spatial Arbitrage Command Center</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
 :root {
-  --bg: #0a0e17; --bg-card: rgba(16,22,40,0.85); --border: rgba(56,189,248,0.15);
+  --bg: #0b0f1a; --bg-card: rgba(18,25,45,0.9); --border: rgba(56,189,248,0.12);
   --text: #e2e8f0; --text-dim: #94a3b8; --accent: #38bdf8; --accent2: #a78bfa;
   --profit: #34d399; --loss: #f87171; --warn: #fbbf24; --glass: rgba(255,255,255,0.03);
 }
 * { margin:0; padding:0; box-sizing:border-box; }
 body {
-  background: var(--bg);
-  color: var(--text);
-  font-family: 'Segoe UI', system-ui, sans-serif;
+  background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif;
   min-height: 100vh;
   background-image:
-    radial-gradient(circle at 10% 20%, rgba(56,189,248,0.08) 0%, transparent 40%),
-    radial-gradient(circle at 90% 80%, rgba(167,139,250,0.08) 0%, transparent 40%);
+    radial-gradient(circle at 15% 25%, rgba(56,189,248,0.06) 0%, transparent 45%),
+    radial-gradient(circle at 85% 75%, rgba(167,139,250,0.06) 0%, transparent 45%);
 }
 .header {
-  padding: 20px 30px;
-  border-bottom: 1px solid var(--border);
+  padding: 18px 28px; border-bottom: 1px solid var(--border);
   display: flex; justify-content: space-between; align-items: center;
   background: var(--glass); backdrop-filter: blur(12px);
 }
-.header h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: -0.5px; }
+.header h1 { font-size: 1.35rem; font-weight: 700; letter-spacing: -0.3px; }
 .header h1 span { color: var(--accent); }
 .badge {
-  padding: 6px 14px; border-radius: 20px; font-size: 0.75rem; font-weight: 600;
+  padding: 5px 12px; border-radius: 20px; font-size: 0.72rem; font-weight: 600;
   text-transform: uppercase; letter-spacing: 0.5px;
 }
-.badge.closed { background: rgba(52,211,153,0.15); color: var(--profit); border: 1px solid rgba(52,211,153,0.3); }
-.badge.open { background: rgba(248,113,113,0.15); color: var(--loss); border: 1px solid rgba(248,113,113,0.3); }
+.badge.closed { background: rgba(52,211,153,0.12); color: var(--profit); border: 1px solid rgba(52,211,153,0.25); }
+.badge.open { background: rgba(248,113,113,0.12); color: var(--loss); border: 1px solid rgba(248,113,113,0.25); }
 
 .slicer-panel {
-  margin: 20px 30px;
-  padding: 18px 24px;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 16px;
-  backdrop-filter: blur(12px);
-  display: flex; flex-wrap: wrap; gap: 16px; align-items: center;
+  margin: 18px 28px; padding: 16px 22px;
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 14px;
+  backdrop-filter: blur(12px); display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end;
 }
-.slicer-group { display: flex; flex-direction: column; gap: 6px; }
-.slicer-group label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); font-weight: 600; }
+.slicer-group { display: flex; flex-direction: column; gap: 5px; }
+.slicer-group label { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); font-weight: 600; }
 .slicer-group select, .slicer-group input {
   background: var(--glass); border: 1px solid var(--border); color: var(--text);
-  padding: 8px 14px; border-radius: 10px; font-size: 0.85rem; outline: none;
-  min-width: 140px; cursor: pointer; transition: all 0.2s;
+  padding: 7px 12px; border-radius: 8px; font-size: 0.82rem; outline: none;
+  min-width: 130px; cursor: pointer; transition: all 0.2s;
 }
 .slicer-group select:hover, .slicer-group input:hover { border-color: var(--accent); }
-.slicer-group select:focus, .slicer-group input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(56,189,248,0.1); }
+.slicer-group select:focus, .slicer-group input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(56,189,248,0.08); }
 .slicer-btn {
   background: linear-gradient(135deg, var(--accent), var(--accent2));
-  border: none; color: #fff; padding: 10px 22px; border-radius: 10px;
-  font-weight: 600; font-size: 0.85rem; cursor: pointer; transition: all 0.2s;
-  margin-left: auto; align-self: flex-end;
+  border: none; color: #fff; padding: 9px 20px; border-radius: 8px;
+  font-weight: 600; font-size: 0.82rem; cursor: pointer; transition: all 0.2s;
 }
-.slicer-btn:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(56,189,248,0.25); }
+.slicer-btn:hover { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(56,189,248,0.2); }
+.slicer-btn:active { transform: translateY(0); }
 
 .kpi-grid {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 16px; margin: 0 30px 20px;
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 14px; margin: 0 28px 18px;
 }
 .kpi-card {
-  background: var(--bg-card); border: 1px solid var(--border); border-radius: 16px;
-  padding: 20px; backdrop-filter: blur(12px); transition: all 0.3s;
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 14px;
+  padding: 18px; backdrop-filter: blur(12px); transition: all 0.25s;
 }
-.kpi-card:hover { border-color: rgba(56,189,248,0.3); transform: translateY(-2px); }
-.kpi-card .kpi-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 8px; }
-.kpi-card .kpi-value { font-size: 1.6rem; font-weight: 700; }
-.kpi-card .kpi-sub { font-size: 0.8rem; color: var(--text-dim); margin-top: 4px; }
+.kpi-card:hover { border-color: rgba(56,189,248,0.25); transform: translateY(-1px); }
+.kpi-card .kpi-label { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 6px; }
+.kpi-card .kpi-value { font-size: 1.5rem; font-weight: 700; }
+.kpi-card .kpi-sub { font-size: 0.78rem; color: var(--text-dim); margin-top: 3px; }
 .kpi-profit { color: var(--profit); }
 .kpi-loss { color: var(--loss); }
 
 .chart-grid {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
-  gap: 16px; margin: 0 30px 20px;
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+  gap: 14px; margin: 0 28px 18px;
 }
 .chart-card {
-  background: var(--bg-card); border: 1px solid var(--border); border-radius: 16px;
-  padding: 20px; backdrop-filter: blur(12px);
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 14px;
+  padding: 18px; backdrop-filter: blur(12px);
 }
-.chart-card h3 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 14px; }
-.chart-wrapper { position: relative; height: 260px; }
+.chart-card h3 { font-size: 0.82rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 12px; }
+.chart-wrapper { position: relative; height: 240px; }
 
 .trade-panel {
-  margin: 0 30px 30px;
-  background: var(--bg-card); border: 1px solid var(--border); border-radius: 16px;
-  padding: 20px; backdrop-filter: blur(12px);
+  margin: 0 28px 28px;
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 14px;
+  padding: 18px; backdrop-filter: blur(12px);
 }
-.trade-panel h3 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 14px; }
-.trade-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
-.trade-table th { text-align: left; padding: 10px 12px; color: var(--text-dim); font-weight: 600; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); }
-.trade-table td { padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,0.03); }
+.trade-panel h3 { font-size: 0.82rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 12px; }
+.trade-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
+.trade-table th { text-align: left; padding: 9px 10px; color: var(--text-dim); font-weight: 600; text-transform: uppercase; font-size: 0.68rem; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); }
+.trade-table td { padding: 9px 10px; border-bottom: 1px solid rgba(255,255,255,0.025); }
 .trade-table tr:hover { background: var(--glass); }
 .status-filled { color: var(--profit); font-weight: 600; }
 .status-failed { color: var(--loss); font-weight: 600; }
 .status-partial { color: var(--warn); font-weight: 600; }
 
 .footer {
-  text-align: center; padding: 20px; color: var(--text-dim); font-size: 0.75rem;
+  text-align: center; padding: 18px; color: var(--text-dim); font-size: 0.72rem;
   border-top: 1px solid var(--border);
 }
 
-@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
-.live-dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--profit); margin-right:8px; animation:pulse 2s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+.live-dot { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--profit); margin-right:7px; animation:pulse 2.5s infinite; }
+.no-data { text-align:center; color:var(--text-dim); padding:30px; font-size:0.85rem; }
 </style>
 </head>
 <body>
 
 <div class="header">
   <div>
-    <h1><span>ARB</span> v5.1 &mdash; Spatial Arbitrage Command Center</h1>
-    <div style="margin-top:6px;font-size:0.8rem;color:var(--text-dim);">
-      <span class="live-dot"></span>Live | <span id="uptime">0s</span> | Auto-refresh: <span id="refreshLabel">2s</span>
+    <h1><span>ARB</span> v5.2 &mdash; Spatial Arbitrage Command Center</h1>
+    <div style="margin-top:5px;font-size:0.78rem;color:var(--text-dim);">
+      <span class="live-dot"></span>Live | Uptime: <span id="uptime">0s</span> | Refresh: <span id="refreshLabel">2s</span>
     </div>
   </div>
   <div class="badge closed" id="circuitBadge">CIRCUIT: CLOSED</div>
@@ -771,7 +793,7 @@ body {
       <option value="10000">10 seconds</option>
     </select>
   </div>
-  <button class="slicer-btn" onclick="applySlicers()">Apply Filters</button>
+  <button class="slicer-btn" id="applyBtn">Apply Filters</button>
 </div>
 
 <!-- KPI CARDS -->
@@ -784,7 +806,7 @@ body {
   <div class="kpi-card">
     <div class="kpi-label">Success Rate</div>
     <div class="kpi-value" id="kpiRate">0.0%</div>
-    <div class="kpi-sub" id="kpiRateSub">Executed / Detected</div>
+    <div class="kpi-sub" id="kpiRateSub">0 / 0</div>
   </div>
   <div class="kpi-card">
     <div class="kpi-label">Avg Exec Latency</div>
@@ -838,105 +860,110 @@ body {
 
 <!-- TRADE LOG -->
 <div class="trade-panel">
-  <h3>Trade Log <span style="float:right;font-weight:400;color:var(--text-dim);font-size:0.75rem;" id="tradeCount">0 trades</span></h3>
+  <h3>Trade Log <span style="float:right;font-weight:400;color:var(--text-dim);font-size:0.72rem;" id="tradeCount">0 trades</span></h3>
   <div style="overflow-x:auto;">
     <table class="trade-table">
       <thead>
-        <tr><th>Time</th><th>ID</th><th>Buy</th><th>Sell</th><th>Buy VWAP</th><th>Sell VWAP</th><th>Volume</th><th>Net Profit</th><th>Latency</th><th>Status</th></tr>
+        <tr>
+          <th>Time</th><th>ID</th><th>Buy</th><th>Sell</th>
+          <th>Buy VWAP</th><th>Sell VWAP</th><th>Volume</th>
+          <th>Net Profit</th><th>Latency</th><th>Status</th>
+        </tr>
       </thead>
       <tbody id="tradeBody">
-        <tr><td colspan="10" style="text-align:center;color:var(--text-dim);">No trades yet...</td></tr>
+        <tr><td colspan="10" class="no-data">Waiting for trades...</td></tr>
       </tbody>
     </table>
   </div>
 </div>
 
-<div class="footer">Spatial Arbitrage Engine v5.1 | Zero-Gap Architecture | Built for Profit</div>
+<div class="footer">Spatial Arbitrage Engine v5.2 | Zero-Gap Architecture | Built for Profit</div>
 
 <script>
-// ===================== CHART SETUP =====================
-const chartConfig = (label, color, fill=false) => ({
-  type: 'line',
-  data: { labels: [], datasets: [{ label, data: [], borderColor: color, backgroundColor: color+'20', borderWidth: 2, pointRadius: 0, tension: 0.4, fill }] },
-  options: {
-    responsive: true, maintainAspectRatio: false,
-    plugins: { legend: { display: false } },
-    scales: {
-      x: { grid: { color: 'rgba(255,255,255,0.03)' }, ticks: { color: '#64748b', font: {size:10} } },
-      y: { grid: { color: 'rgba(255,255,255,0.03)' }, ticks: { color: '#64748b', font: {size:10} } }
-    },
-    animation: { duration: 300 }
-  }
-});
+// ===================== CHART CONFIG =====================
+Chart.defaults.color = '#64748b';
+Chart.defaults.borderColor = 'rgba(255,255,255,0.04)';
+Chart.defaults.font.family = "'Segoe UI', system-ui, sans-serif";
+Chart.defaults.font.size = 11;
 
-const pnlChart = new Chart(document.getElementById('pnlChart'), chartConfig('Realized P&L', '#34d399', true));
-const latChart = new Chart(document.getElementById('latChart'), chartConfig('Latency', '#a78bfa'));
-latChart.data.datasets.push({ label: 'p99', data: [], borderColor: '#f87171', borderWidth: 1, pointRadius: 0, tension: 0.4 });
-const sigChart = new Chart(document.getElementById('sigChart'), chartConfig('Detected', '#38bdf8', true));
-sigChart.data.datasets.push({ label: 'Executed', data: [], borderColor: '#34d399', backgroundColor: '#34d39920', borderWidth: 2, pointRadius: 0, tension: 0.4, fill: true });
-const spreadChart = new Chart(document.getElementById('spreadChart'), chartConfig('Binance', '#38bdf8'));
-spreadChart.data.datasets.push({ label: 'Kraken', data: [], borderColor: '#a78bfa', borderWidth: 2, pointRadius: 0, tension: 0.4 });
-const priceChart = new Chart(document.getElementById('priceChart'), chartConfig('Binance', '#38bdf8'));
-priceChart.data.datasets.push({ label: 'Kraken', data: [], borderColor: '#a78bfa', borderWidth: 2, pointRadius: 0, tension: 0.4 });
+function makeChart(ctx, label, color, fill) {
+  return new Chart(ctx, {
+    type: 'line',
+    data: { labels: [], datasets: [{ label, data: [], borderColor: color, backgroundColor: color + '18', borderWidth: 2, pointRadius: 0, pointHoverRadius: 4, tension: 0.35, fill: fill }] },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, interaction: { intersect: false, mode: 'index' }, scales: { x: { grid: { display: false }, ticks: { maxTicksLimit: 8 } }, y: { grid: { color: 'rgba(255,255,255,0.03)' } } }, animation: { duration: 400 } }
+  });
+}
+
+const pnlChart = makeChart(document.getElementById('pnlChart'), 'P&L', '#34d399', true);
+const latChart = makeChart(document.getElementById('latChart'), 'p50', '#a78bfa', false);
+latChart.data.datasets.push({ label: 'p99', data: [], borderColor: '#f87171', backgroundColor: '#f8717118', borderWidth: 1.5, pointRadius: 0, tension: 0.35, fill: false });
+const sigChart = makeChart(document.getElementById('sigChart'), 'Detected', '#38bdf8', true);
+sigChart.data.datasets.push({ label: 'Executed', data: [], borderColor: '#34d399', backgroundColor: '#34d39918', borderWidth: 2, pointRadius: 0, tension: 0.35, fill: true });
+const spreadChart = makeChart(document.getElementById('spreadChart'), 'Binance', '#38bdf8', false);
+spreadChart.data.datasets.push({ label: 'Kraken', data: [], borderColor: '#a78bfa', backgroundColor: '#a78bfa18', borderWidth: 2, pointRadius: 0, tension: 0.35, fill: false });
+const priceChart = makeChart(document.getElementById('priceChart'), 'Binance', '#38bdf8', false);
+priceChart.data.datasets.push({ label: 'Kraken', data: [], borderColor: '#a78bfa', backgroundColor: '#a78bfa18', borderWidth: 2, pointRadius: 0, tension: 0.35, fill: false });
 const circuitChart = new Chart(document.getElementById('circuitChart'), {
   type: 'line',
-  data: { labels: [], datasets: [{ label: 'Circuit', data: [], borderColor: '#fbbf24', backgroundColor: '#fbbf2420', borderWidth: 2, pointRadius: 0, tension: 0, fill: true, stepped: true }] },
-  options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { grid: { color: 'rgba(255,255,255,0.03)' }, ticks: { color: '#64748b', font: {size:10} } }, y: { min: 0, max: 1.2, grid: { color: 'rgba(255,255,255,0.03)' }, ticks: { color: '#64748b', font: {size:10}, callback: v => v===1?'CLOSED':'OPEN' } } }, animation: { duration: 300 } }
+  data: { labels: [], datasets: [{ label: 'Circuit', data: [], borderColor: '#fbbf24', backgroundColor: '#fbbf2418', borderWidth: 2, pointRadius: 0, tension: 0, fill: true, stepped: true }] },
+  options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { grid: { display: false }, ticks: { maxTicksLimit: 8 } }, y: { min: -0.1, max: 1.3, grid: { color: 'rgba(255,255,255,0.03)' }, ticks: { callback: v => v >= 0.5 ? 'CLOSED' : 'OPEN', stepSize: 1 } } }, animation: { duration: 300 } }
 });
+
+const charts = [pnlChart, latChart, sigChart, spreadChart, priceChart, circuitChart];
 
 // ===================== STATE =====================
 let allData = { timestamps: [], realized_pnl: [], exec_latency_p50: [], exec_latency_p99: [], detection_latency_avg: [], signals_detected: [], signals_executed: [], binance_spread_bps: [], kraken_spread_bps: [], binance_mid: [], kraken_mid: [], circuit_state: [] };
 let allTrades = [];
 let refreshInterval = 2000;
 let timer = null;
-let startTime = Date.now();
 
-// ===================== SLICER LOGIC =====================
-function applySlicers() {
+// ===================== RENDER =====================
+function render() {
   const timeVal = document.getElementById('timeSlicer').value;
   const minProfit = parseFloat(document.getElementById('profitSlicer').value) || 0;
   const pairVal = document.getElementById('pairSlicer').value;
   const statusVal = document.getElementById('statusSlicer').value;
-  const refreshVal = parseInt(document.getElementById('refreshSlicer').value);
 
-  refreshInterval = refreshVal;
-  document.getElementById('refreshLabel').textContent = (refreshVal/1000) + 's';
-  clearInterval(timer);
-  timer = setInterval(fetchData, refreshInterval);
+  // Slice chart data by time
+  let s = 0;
+  if (timeVal !== 'all' && allData.timestamps.length > 0) {
+    const secs = parseInt(timeVal);
+    const points = Math.ceil(secs / 2);
+    s = Math.max(0, allData.timestamps.length - points);
+  }
+  const e = allData.timestamps.length;
 
-  // Filter trades
+  // Update charts
+  updateChart(pnlChart, allData.timestamps.slice(s, e), [allData.realized_pnl.slice(s, e)]);
+  updateChart(latChart, allData.timestamps.slice(s, e), [allData.exec_latency_p50.slice(s, e), allData.exec_latency_p99.slice(s, e)]);
+  updateChart(sigChart, allData.timestamps.slice(s, e), [allData.signals_detected.slice(s, e), allData.signals_executed.slice(s, e)]);
+  updateChart(spreadChart, allData.timestamps.slice(s, e), [allData.binance_spread_bps.slice(s, e), allData.kraken_spread_bps.slice(s, e)]);
+  updateChart(priceChart, allData.timestamps.slice(s, e), [allData.binance_mid.slice(s, e), allData.kraken_mid.slice(s, e)]);
+  updateChart(circuitChart, allData.timestamps.slice(s, e), [allData.circuit_state.slice(s, e)]);
+
+  // Filter & render trades
   let filtered = allTrades.filter(t => {
     const profit = parseFloat(t.net_profit || 0);
     if (profit < minProfit) return false;
     if (pairVal !== 'all') {
-      const pair = t.buy_exchange + '_' + t.sell_exchange;
+      const pair = (t.buy_exchange || '') + '_' + (t.sell_exchange || '');
       if (pair !== pairVal) return false;
     }
-    if (statusVal !== 'all' && t.status !== statusVal) return false;
+    if (statusVal !== 'all') {
+      const st = (t.status || '').toUpperCase();
+      if (st === 'PARTIAL_BUY_ONLY' || st === 'PARTIAL_SELL_ONLY') {
+        if (statusVal !== 'PARTIAL') return false;
+      } else if (st !== statusVal) {
+        return false;
+      }
+    }
     return true;
   });
-
   renderTrades(filtered);
-
-  // Filter chart data by time range
-  let sliceCount = allData.timestamps.length;
-  if (timeVal !== 'all') {
-    const secs = parseInt(timeVal);
-    const points = Math.min(Math.ceil(secs / 2), allData.timestamps.length);
-    sliceCount = points;
-  }
-  const s = allData.timestamps.length - sliceCount;
-  const e = allData.timestamps.length;
-
-  updateChart(pnlChart, allData.timestamps.slice(s,e), [allData.realized_pnl.slice(s,e)]);
-  updateChart(latChart, allData.timestamps.slice(s,e), [allData.exec_latency_p50.slice(s,e), allData.exec_latency_p99.slice(s,e)]);
-  updateChart(sigChart, allData.timestamps.slice(s,e), [allData.signals_detected.slice(s,e), allData.signals_executed.slice(s,e)]);
-  updateChart(spreadChart, allData.timestamps.slice(s,e), [allData.binance_spread_bps.slice(s,e), allData.kraken_spread_bps.slice(s,e)]);
-  updateChart(priceChart, allData.timestamps.slice(s,e), [allData.binance_mid.slice(s,e), allData.kraken_mid.slice(s,e)]);
-  updateChart(circuitChart, allData.timestamps.slice(s,e), [allData.circuit_state.slice(s,e)]);
 }
 
 function updateChart(chart, labels, datasets) {
+  if (!labels.length) return;
   chart.data.labels = labels;
   datasets.forEach((d, i) => { if (chart.data.datasets[i]) chart.data.datasets[i].data = d; });
   chart.update('none');
@@ -946,25 +973,29 @@ function renderTrades(trades) {
   const tbody = document.getElementById('tradeBody');
   document.getElementById('tradeCount').textContent = trades.length + ' trades';
   if (!trades.length) {
-    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--text-dim);">No trades match filters...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="no-data">No trades match current filters</td></tr>';
     return;
   }
   tbody.innerHTML = trades.slice(0, 50).map(t => {
     const profit = parseFloat(t.net_profit || 0);
     const profitClass = profit >= 0 ? 'kpi-profit' : 'kpi-loss';
-    const statusClass = t.status === 'FILLED' ? 'status-filled' : t.status === 'FAILED' ? 'status-failed' : 'status-partial';
-    return `<tr>
-      <td>${t.timestamp ? t.timestamp.split('T')[1].split('.')[0] : '-'}</td>
-      <td>${t.execution_id?.slice(-8) || '-'}</td>
-      <td>${t.buy_exchange || '-'}</td>
-      <td>${t.sell_exchange || '-'}</td>
-      <td>$${t.buy_vwap || '0'}</td>
-      <td>$${t.sell_vwap || '0'}</td>
-      <td>${t.target_volume || '0'} BTC</td>
-      <td class="${profitClass}">$${profit.toFixed(2)}</td>
-      <td>${t.latency_us || 0} &mu;s</td>
-      <td class="${statusClass}">${t.status || '-'}</td>
-    </tr>`;
+    let statusClass = 'status-partial';
+    const st = (t.status || '').toUpperCase();
+    if (st === 'FILLED') statusClass = 'status-filled';
+    else if (st === 'FAILED') statusClass = 'status-failed';
+    const ts = t.timestamp ? t.timestamp.split('T')[1].split('.')[0] : '-';
+    return '<tr>' +
+      '<td>' + ts + '</td>' +
+      '<td>' + (t.execution_id ? t.execution_id.slice(-8) : '-') + '</td>' +
+      '<td>' + (t.buy_exchange || '-') + '</td>' +
+      '<td>' + (t.sell_exchange || '-') + '</td>' +
+      '<td>$' + (t.buy_vwap || '0') + '</td>' +
+      '<td>$' + (t.sell_vwap || '0') + '</td>' +
+      '<td>' + (t.target_volume || '0') + ' BTC</td>' +
+      '<td class="' + profitClass + '">$' + profit.toFixed(2) + '</td>' +
+      '<td>' + (t.latency_us || 0) + ' &mu;s</td>' +
+      '<td class="' + statusClass + '">' + (t.status || '-') + '</td>' +
+      '</tr>';
   }).join('');
 }
 
@@ -972,13 +1003,15 @@ function renderTrades(trades) {
 async function fetchData() {
   try {
     const [mRes, tRes] = await Promise.all([fetch('/metrics'), fetch('/api/trades')]);
+    if (!mRes.ok || !tRes.ok) throw new Error('HTTP error');
     const m = await mRes.json();
     const t = await tRes.json();
 
     // Update KPIs
     const pnl = parseFloat(m.pnl?.total_realized_pnl || 0);
-    document.getElementById('kpiPnl').textContent = (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2);
-    document.getElementById('kpiPnl').className = 'kpi-value ' + (pnl >= 0 ? 'kpi-profit' : 'kpi-loss');
+    const pnlEl = document.getElementById('kpiPnl');
+    pnlEl.textContent = (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2);
+    pnlEl.className = 'kpi-value ' + (pnl >= 0 ? 'kpi-profit' : 'kpi-loss');
 
     const rate = m.engine?.success_rate || 0;
     document.getElementById('kpiRate').textContent = rate.toFixed(1) + '%';
@@ -987,12 +1020,12 @@ async function fetchData() {
     const lat = m.latency?.execution_us?.p50 || 0;
     document.getElementById('kpiLat').textContent = Math.round(lat) + ' μs';
 
-    const sigMin = m.engine?.signals_detected ? Math.round(m.engine.signals_detected / Math.max(m.engine.uptime_sec/60, 1)) : 0;
+    const sigMin = m.engine?.signals_detected ? Math.round(m.engine.signals_detected / Math.max(m.engine.uptime_sec / 60, 1)) : 0;
     document.getElementById('kpiSig').textContent = sigMin;
 
     document.getElementById('kpiTrades').textContent = m.pnl?.trade_count || 0;
 
-    const bSpread = m.charts?.binance_spread_bps?.slice(-1)[0] || 0;
+    const bSpread = m.charts?.binance_spread_bps?.length ? m.charts.binance_spread_bps[m.charts.binance_spread_bps.length - 1] : 0;
     document.getElementById('kpiSpread').textContent = bSpread.toFixed(2) + ' bps';
 
     // Circuit badge
@@ -1003,15 +1036,26 @@ async function fetchData() {
 
     // Uptime
     const up = Math.floor(m.engine?.uptime_sec || 0);
-    document.getElementById('uptime').textContent = Math.floor(up/60) + 'm ' + (up%60) + 's';
+    document.getElementById('uptime').textContent = Math.floor(up / 60) + 'm ' + (up % 60) + 's';
 
-    // Store all data
-    allData = m.charts;
+    // Store data
+    allData = m.charts || allData;
     allTrades = t.trades || [];
 
-    applySlicers();
-  } catch (e) { console.error('Fetch error:', e); }
+    render();
+  } catch (e) {
+    console.error('Fetch error:', e);
+  }
 }
+
+// ===================== EVENTS =====================
+document.getElementById('applyBtn').addEventListener('click', render);
+document.getElementById('refreshSlicer').addEventListener('change', function() {
+  refreshInterval = parseInt(this.value);
+  document.getElementById('refreshLabel').textContent = (refreshInterval / 1000) + 's';
+  clearInterval(timer);
+  timer = setInterval(fetchData, refreshInterval);
+});
 
 // ===================== INIT =====================
 timer = setInterval(fetchData, refreshInterval);
@@ -1022,7 +1066,8 @@ fetchData();
 
     async def shutdown(self):
         if self._server:
-            self._server.close(); await self._server.wait_closed()
+            self._server.close()
+            await self._server.wait_closed()
         LOG.info("[HEALTH] Shutdown.")
 
 # =============================================================================
@@ -1031,7 +1076,9 @@ fetchData();
 
 class ExchangeWebSocketManager:
     def __init__(self, config, symbol, reconnect_base_delay_ms=100, reconnect_max_delay_ms=30000):
-        self.config = config; self.symbol = symbol; self.exchange_id = config.exchange_id
+        self.config = config
+        self.symbol = symbol
+        self.exchange_id = config.exchange_id
         self._reconnect_base_delay_ms = reconnect_base_delay_ms
         self._reconnect_max_delay_ms = reconnect_max_delay_ms
         self._consecutive_failures = 0
@@ -1044,14 +1091,22 @@ class ExchangeWebSocketManager:
         self._last_message_ns = 0
 
     async def _create_exchange(self):
-        if ccxtpro is None: raise RuntimeError("ccxt not installed")
+        if ccxtpro is None:
+            raise RuntimeError("ccxt not installed")
         exchange_class = getattr(ccxtpro, self.exchange_id.value, None)
-        if exchange_class is None: raise RuntimeError("Exchange %s not supported" % self.exchange_id.value)
-        instance = exchange_class({'apiKey': self.config.api_key, 'secret': self.config.api_secret,
-                                   'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
+        if exchange_class is None:
+            raise RuntimeError("Exchange %s not supported" % self.exchange_id.value)
+        instance = exchange_class({
+            'apiKey': self.config.api_key,
+            'secret': self.config.api_secret,
+            'enableRateLimit': True,
+            'options': {'defaultType': 'spot'}
+        })
         if self.config.sandbox:
-            try: instance.set_sandbox_mode(True)
-            except Exception as e: LOG.warning("[%s] Sandbox unavailable: %s" % (self.exchange_id.value, e))
+            try:
+                instance.set_sandbox_mode(True)
+            except Exception as e:
+                LOG.warning("[%s] Sandbox unavailable: %s" % (self.exchange_id.value, e))
         return instance
 
     async def connect(self):
@@ -1060,34 +1115,54 @@ class ExchangeWebSocketManager:
                 LOG.info("[%s] Connecting..." % self.exchange_id.value)
                 self._exchange = await self._create_exchange()
                 await self._exchange.load_markets()
-                self._is_connected = True; self._consecutive_failures = 0
+                self._is_connected = True
+                self._consecutive_failures = 0
                 LOG.info("[%s] Connected." % self.exchange_id.value)
                 await self._consume_order_book()
             except Exception as e:
-                self._consecutive_failures += 1; self._is_connected = False
-                delay_ms = min(self._reconnect_base_delay_ms * (2 ** (self._consecutive_failures - 1)), self._reconnect_max_delay_ms)
-                LOG.error("[%s] Fail #%d: %s. Reconnect %dms..." % (self.exchange_id.value, self._consecutive_failures, e, delay_ms))
+                self._consecutive_failures += 1
+                self._is_connected = False
+                delay_ms = min(
+                    self._reconnect_base_delay_ms * (2 ** (self._consecutive_failures - 1)),
+                    self._reconnect_max_delay_ms
+                )
+                LOG.error("[%s] Fail #%d: %s. Reconnect %dms..." % (
+                    self.exchange_id.value, self._consecutive_failures, e, delay_ms))
                 if self._exchange:
-                    try: await self._exchange.close()
-                    except: pass
+                    try:
+                        await self._exchange.close()
+                    except:
+                        pass
                 self._exchange = None
-                try: await asyncio.wait_for(self._shutdown_event.wait(), timeout=delay_ms / 1000.0)
-                except asyncio.TimeoutError: pass
+                try:
+                    await asyncio.wait_for(
+                        self._shutdown_event.wait(),
+                        timeout=delay_ms / 1000.0
+                    )
+                except asyncio.TimeoutError:
+                    pass
 
     async def _consume_order_book(self):
-        if self._exchange is None: return
+        if self._exchange is None:
+            return
         try:
             while not self._shutdown_event.is_set():
                 try:
                     ob = await self._exchange.watch_order_book(self.symbol)
                     now_ns = time.time_ns()
-                    self._last_message_ns = now_ns; self._messages_received += 1
+                    self._last_message_ns = now_ns
+                    self._messages_received += 1
                     async with self._lock:
                         self._order_book = self._normalize_order_book(ob, now_ns)
                 except Exception as e:
-                    LOG.error("[%s] Stream: %s" % (self.exchange_id.value, e)); raise
-        except asyncio.CancelledError: LOG.info("[%s] Cancelled." % self.exchange_id.value); raise
-        except Exception as e: LOG.error("[%s] Fatal: %s" % (self.exchange_id.value, e)); raise
+                    LOG.error("[%s] Stream: %s" % (self.exchange_id.value, e))
+                    raise
+        except asyncio.CancelledError:
+            LOG.info("[%s] Cancelled." % self.exchange_id.value)
+            raise
+        except Exception as e:
+            LOG.error("[%s] Fatal: %s" % (self.exchange_id.value, e))
+            raise
 
     def _normalize_order_book(self, raw_ob, timestamp_ns):
         bids = [OrderBookLevel(level[0], level[1]) for level in raw_ob.get('bids', [])]
@@ -1095,20 +1170,27 @@ class ExchangeWebSocketManager:
         return OrderBookSnapshot(self.exchange_id, self.symbol, timestamp_ns, bids, asks)
 
     async def get_order_book(self):
-        async with self._lock: return self._order_book
+        async with self._lock:
+            return self._order_book
 
     @property
-    def is_connected(self): return self._is_connected
+    def is_connected(self):
+        return self._is_connected
+
     @property
-    def messages_received(self): return self._messages_received
+    def messages_received(self):
+        return self._messages_received
 
     async def shutdown(self):
         LOG.info("[%s] Shutdown." % self.exchange_id.value)
-        self._shutdown_event.set(); self._is_connected = False
+        self._shutdown_event.set()
+        self._is_connected = False
         if self._exchange:
-            try: await self._exchange.close()
-            except Exception as e: LOG.warning("[%s] Close err: %s" % (self.exchange_id.value, e))
-            finally: self._exchange = None
+            try:
+                await self._exchange.close()
+            except Exception as e:
+                LOG.warning("[%s] Close err: %s" % (self.exchange_id.value, e))
+        self._exchange = None
 
 
 # =============================================================================
@@ -1117,8 +1199,11 @@ class ExchangeWebSocketManager:
 
 class SyntheticExchangeManager:
     def __init__(self, exchange_id, symbol, base_price, volatility=0.002, arb_inject_prob=0.05):
-        self.exchange_id = exchange_id; self.symbol = symbol; self.base_price = base_price
-        self.volatility = volatility; self.arb_inject_prob = arb_inject_prob
+        self.exchange_id = exchange_id
+        self.symbol = symbol
+        self.base_price = base_price
+        self.volatility = volatility
+        self.arb_inject_prob = arb_inject_prob
         self._current_price = base_price
         self._order_book = None
         self._lock = asyncio.Lock()
@@ -1131,13 +1216,20 @@ class SyntheticExchangeManager:
     async def connect(self):
         LOG.info("[%s] Synthetic generator starting..." % self.exchange_id.value)
         self._task = asyncio.create_task(self._generate_loop())
-        try: await self._task
-        except asyncio.CancelledError: LOG.info("[%s] Synthetic stopped." % self.exchange_id.value)
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            LOG.info("[%s] Synthetic stopped." % self.exchange_id.value)
 
     async def _generate_loop(self):
         while not self._shutdown_event.is_set():
-            try: await asyncio.wait_for(self._shutdown_event.wait(), timeout=0.1)
-            except asyncio.TimeoutError: await self._generate_snapshot()
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=0.1
+                )
+            except asyncio.TimeoutError:
+                await self._generate_snapshot()
 
     async def _generate_snapshot(self):
         now_ns = time.time_ns()
@@ -1145,11 +1237,13 @@ class SyntheticExchangeManager:
         noise = random.gauss(0, self.volatility * self._current_price)
         if random.random() < self.arb_inject_prob:
             self._arb_bias = random.choice([-0.008, 0.008])
-        else: self._arb_bias *= 0.95
+        else:
+            self._arb_bias *= 0.95
         self._current_price += drift + noise + (self._arb_bias * self._current_price)
         self._current_price = max(self._current_price, 1000.0)
         price = Decimal(str(round(self._current_price, 2)))
-        bids = []; asks = []
+        bids = []
+        asks = []
         for i in range(20):
             bp = price * (Decimal("1") - Decimal(str(0.0001 * (i + 1))))
             ap = price * (Decimal("1") + Decimal(str(0.0001 * (i + 1))))
@@ -1160,24 +1254,32 @@ class SyntheticExchangeManager:
         bids.sort(key=lambda x: x.price, reverse=True)
         asks.sort(key=lambda x: x.price)
         async with self._lock:
-            self._order_book = OrderBookSnapshot(self.exchange_id, self.symbol, now_ns, bids, asks)
+            self._order_book = OrderBookSnapshot(
+                self.exchange_id, self.symbol, now_ns, bids, asks)
             self._messages_received += 1
 
     async def get_order_book(self):
-        async with self._lock: return self._order_book
+        async with self._lock:
+            return self._order_book
 
     @property
-    def is_connected(self): return self._is_connected and not self._shutdown_event.is_set()
+    def is_connected(self):
+        return self._is_connected and not self._shutdown_event.is_set()
+
     @property
-    def messages_received(self): return self._messages_received
+    def messages_received(self):
+        return self._messages_received
 
     async def shutdown(self):
         LOG.info("[%s] Synthetic shutdown." % self.exchange_id.value)
-        self._shutdown_event.set(); self._is_connected = False
+        self._shutdown_event.set()
+        self._is_connected = False
         if self._task and not self._task.done():
             self._task.cancel()
-            try: await self._task
-            except asyncio.CancelledError: pass
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
 
 
 # =============================================================================
@@ -1197,9 +1299,14 @@ class ExecutionRouter:
             eid, signal.buy_exchange.value, signal.buy_vwap,
             signal.sell_exchange.value, signal.sell_vwap, signal.net_profit))
 
-        buy_task = self._place_order(exchanges[signal.buy_exchange], TradeSide.BUY, signal.symbol, signal.target_volume, eid)
-        sell_task = self._place_order(exchanges[signal.sell_exchange], TradeSide.SELL, signal.symbol, signal.target_volume, eid)
-        buy_res, sell_res = await asyncio.gather(buy_task, sell_task, return_exceptions=True)
+        buy_task = self._place_order(
+            exchanges[signal.buy_exchange], TradeSide.BUY,
+            signal.symbol, signal.target_volume, eid)
+        sell_task = self._place_order(
+            exchanges[signal.sell_exchange], TradeSide.SELL,
+            signal.symbol, signal.target_volume, eid)
+        buy_res, sell_res = await asyncio.gather(
+            buy_task, sell_task, return_exceptions=True)
 
         end_ns = time.time_ns()
         latency_us = (end_ns - start_ns) // 1000
@@ -1207,22 +1314,35 @@ class ExecutionRouter:
         buy_ok = not isinstance(buy_res, Exception)
         sell_ok = not isinstance(sell_res, Exception)
 
-        if buy_ok and sell_ok: status = "FILLED"; err = None
-        elif buy_ok and not sell_ok: status = "PARTIAL_BUY_ONLY"; err = "Sell failed: %s" % sell_res
-        elif not buy_ok and sell_ok: status = "PARTIAL_SELL_ONLY"; err = "Buy failed: %s" % buy_res
-        else: status = "FAILED"; err = "Buy:%s | Sell:%s" % (buy_res, sell_res)
+        if buy_ok and sell_ok:
+            status = "FILLED"
+            err = None
+        elif buy_ok and not sell_ok:
+            status = "PARTIAL_BUY_ONLY"
+            err = "Sell failed: %s" % sell_res
+        elif not buy_ok and sell_ok:
+            status = "PARTIAL_SELL_ONLY"
+            err = "Buy failed: %s" % buy_res
+        else:
+            status = "FAILED"
+            err = "Buy:%s | Sell:%s" % (buy_res, sell_res)
 
         result = ExecutionResult(
-            execution_id=eid, timestamp_ns=end_ns,
-            buy_exchange=signal.buy_exchange, sell_exchange=signal.sell_exchange,
+            execution_id=eid,
+            timestamp_ns=end_ns,
+            buy_exchange=signal.buy_exchange,
+            sell_exchange=signal.sell_exchange,
             buy_order_id=buy_res.get('id') if buy_ok else None,
             sell_order_id=sell_res.get('id') if sell_ok else None,
             buy_fill_price=Decimal(str(buy_res.get('average', buy_res.get('price', 0)))) if buy_ok else None,
             sell_fill_price=Decimal(str(sell_res.get('average', sell_res.get('price', 0)))) if sell_ok else None,
             filled_volume=signal.target_volume if status == "FILLED" else Decimal("0"),
-            status=status, latency_us=latency_us, error_message=err)
+            status=status,
+            latency_us=latency_us,
+            error_message=err)
 
-        async with self._lock: self._execution_history.append(result)
+        async with self._lock:
+            self._execution_history.append(result)
         LOG.info("[EXEC] %s done in %dus | %s" % (eid, latency_us, status))
         return result
 
@@ -1231,13 +1351,24 @@ class ExecutionRouter:
         if is_synthetic:
             await asyncio.sleep(0.0001)
             book = await manager.get_order_book()
-            if book is None: raise RuntimeError("No synthetic book")
+            if book is None:
+                raise RuntimeError("No synthetic book")
             fp = book.best_ask if side == TradeSide.BUY else book.best_bid
-            return {'id': "SIM-%s-%s" % (eid, side.value.upper()), 'symbol': symbol,
-                    'side': side.value, 'type': 'market', 'amount': float(volume),
-                    'price': float(fp), 'average': float(fp), 'status': 'closed',
-                    'filled': float(volume), 'remaining': 0.0, 'cost': float(volume * fp),
-                    'fee': None, 'trades': []}
+            return {
+                'id': "SIM-%s-%s" % (eid, side.value.upper()),
+                'symbol': symbol,
+                'side': side.value,
+                'type': 'market',
+                'amount': float(volume),
+                'price': float(fp),
+                'average': float(fp),
+                'status': 'closed',
+                'filled': float(volume),
+                'remaining': 0.0,
+                'cost': float(volume * fp),
+                'fee': None,
+                'trades': []
+            }
 
         exchange = manager._exchange
         if exchange is None or not manager.is_connected:
@@ -1247,13 +1378,25 @@ class ExecutionRouter:
             await asyncio.sleep(0.0001)
             book = await manager.get_order_book()
             fp = book.best_ask if side == TradeSide.BUY else book.best_bid
-            return {'id': "SIM-%s-%s" % (eid, side.value.upper()), 'symbol': symbol,
-                    'side': side.value, 'type': 'market', 'amount': float(volume),
-                    'price': float(fp), 'average': float(fp), 'status': 'closed',
-                    'filled': float(volume), 'remaining': 0.0, 'cost': float(volume * fp),
-                    'fee': None, 'trades': []}
+            return {
+                'id': "SIM-%s-%s" % (eid, side.value.upper()),
+                'symbol': symbol,
+                'side': side.value,
+                'type': 'market',
+                'amount': float(volume),
+                'price': float(fp),
+                'average': float(fp),
+                'status': 'closed',
+                'filled': float(volume),
+                'remaining': 0.0,
+                'cost': float(volume * fp),
+                'fee': None,
+                'trades': []
+            }
         else:
-            return await exchange.create_order(symbol=symbol, type='market', side=side.value, amount=float(volume))
+            return await exchange.create_order(
+                symbol=symbol, type='market', side=side.value, amount=float(volume))
+
 
 # =============================================================================
 # MICROSECOND PERSISTENCE LAYER
@@ -1261,8 +1404,13 @@ class ExecutionRouter:
 
 class DataSink:
     def __init__(self, db_path="arbitrage_engine.db", csv_path="arbitrage_signals.csv", flush_interval_seconds=60):
-        self.db_path = db_path; self.csv_path = csv_path; self.flush_interval_seconds = flush_interval_seconds
-        self._conn = None; self._cursor = None; self._flush_task = None; self._shutdown_event = asyncio.Event()
+        self.db_path = db_path
+        self.csv_path = csv_path
+        self.flush_interval_seconds = flush_interval_seconds
+        self._conn = None
+        self._cursor = None
+        self._flush_task = None
+        self._shutdown_event = asyncio.Event()
 
     def initialize(self):
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -1273,13 +1421,25 @@ class DataSink:
             self._cursor.execute("PRAGMA temp_store=MEMORY;")
             self._cursor.execute("""
                 CREATE TABLE IF NOT EXISTS arbitrage_signals (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp_ns INTEGER NOT NULL,
-                    received_at TEXT NOT NULL, symbol TEXT NOT NULL, buy_exchange TEXT NOT NULL,
-                    sell_exchange TEXT NOT NULL, buy_vwap TEXT NOT NULL, sell_vwap TEXT NOT NULL,
-                    target_volume TEXT NOT NULL, gross_spread TEXT NOT NULL, buy_fee TEXT NOT NULL,
-                    sell_fee TEXT NOT NULL, gas_fee TEXT NOT NULL, net_profit TEXT NOT NULL,
-                    net_profit_pct TEXT NOT NULL, execution_id TEXT UNIQUE NOT NULL,
-                    executed INTEGER DEFAULT 0, execution_latency_us INTEGER, status TEXT)
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp_ns INTEGER NOT NULL,
+                    received_at TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    buy_exchange TEXT NOT NULL,
+                    sell_exchange TEXT NOT NULL,
+                    buy_vwap TEXT NOT NULL,
+                    sell_vwap TEXT NOT NULL,
+                    target_volume TEXT NOT NULL,
+                    gross_spread TEXT NOT NULL,
+                    buy_fee TEXT NOT NULL,
+                    sell_fee TEXT NOT NULL,
+                    gas_fee TEXT NOT NULL,
+                    net_profit TEXT NOT NULL,
+                    net_profit_pct TEXT NOT NULL,
+                    execution_id TEXT UNIQUE NOT NULL,
+                    executed INTEGER DEFAULT 0,
+                    execution_latency_us INTEGER,
+                    status TEXT)
             """)
             self._cursor.execute("CREATE INDEX IF NOT EXISTS idx_ts ON arbitrage_signals(timestamp_ns)")
             self._cursor.execute("CREATE INDEX IF NOT EXISTS idx_exec ON arbitrage_signals(execution_id)")
@@ -1287,24 +1447,38 @@ class DataSink:
             LOG.info("[DATASINK] SQLite at '%s'." % self.db_path)
 
     def persist_signal(self, signal):
-        if self._cursor is None: raise RuntimeError("Not initialized")
+        if self._cursor is None:
+            raise RuntimeError("Not initialized")
         self._cursor.execute("""
             INSERT OR REPLACE INTO arbitrage_signals (
                 timestamp_ns, received_at, symbol, buy_exchange, sell_exchange,
                 buy_vwap, sell_vwap, target_volume, gross_spread, buy_fee,
                 sell_fee, gas_fee, net_profit, net_profit_pct, execution_id
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (signal.timestamp_ns, datetime.now(timezone.utc).isoformat(), signal.symbol,
-              signal.buy_exchange.value, signal.sell_exchange.value, str(signal.buy_vwap),
-              str(signal.sell_vwap), str(signal.target_volume), str(signal.gross_spread),
-              str(signal.buy_fee), str(signal.sell_fee), str(signal.gas_fee),
-              str(signal.net_profit), str(signal.net_profit_pct), signal.execution_id))
+        """, (
+            signal.timestamp_ns,
+            datetime.now(timezone.utc).isoformat(),
+            signal.symbol,
+            signal.buy_exchange.value,
+            signal.sell_exchange.value,
+            str(signal.buy_vwap),
+            str(signal.sell_vwap),
+            str(signal.target_volume),
+            str(signal.gross_spread),
+            str(signal.buy_fee),
+            str(signal.sell_fee),
+            str(signal.gas_fee),
+            str(signal.net_profit),
+            str(signal.net_profit_pct),
+            signal.execution_id))
         self._conn.commit()
 
     def update_execution_result(self, result):
-        if self._cursor is None: return
-        self._cursor.execute("UPDATE arbitrage_signals SET executed=1, execution_latency_us=?, status=? WHERE execution_id=?",
-                             (result.latency_us, result.status, result.execution_id))
+        if self._cursor is None:
+            return
+        self._cursor.execute(
+            "UPDATE arbitrage_signals SET executed=1, execution_latency_us=?, status=? WHERE execution_id=?",
+            (result.latency_us, result.status, result.execution_id))
         self._conn.commit()
 
     async def start_background_flush(self):
@@ -1313,41 +1487,51 @@ class DataSink:
 
     async def _background_flush_loop(self):
         while not self._shutdown_event.is_set():
-            try: await asyncio.wait_for(self._shutdown_event.wait(), timeout=self.flush_interval_seconds)
-            except asyncio.TimeoutError: await self._flush_to_csv()
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=self.flush_interval_seconds)
+            except asyncio.TimeoutError:
+                await self._flush_to_csv()
 
     async def _flush_to_csv(self):
-        if self._cursor is None: return
+        if self._cursor is None:
+            return
         try:
             self._cursor.execute("SELECT * FROM arbitrage_signals ORDER BY timestamp_ns DESC")
             rows = self._cursor.fetchall()
             columns = [desc[0] for desc in self._cursor.description]
-            if not rows: return
+            if not rows:
+                return
             async with aiofiles.open(self.csv_path, mode='w', newline='') as f:
                 await f.write(','.join(columns) + '\n')
                 for row in rows:
                     escaped = []
                     for val in row:
-                        if val is None: escaped.append('')
+                        if val is None:
+                            escaped.append('')
                         elif isinstance(val, str) and (',' in val or '"' in val or '\n' in val):
                             escaped.append('"' + val.replace('"', '""') + '"')
-                        else: escaped.append(str(val))
+                        else:
+                            escaped.append(str(val))
                     await f.write(','.join(escaped) + '\n')
             LOG.info("[DATASINK] Flushed %d records to %s" % (len(rows), self.csv_path))
-        except Exception as e: LOG.error("[DATASINK] Flush error: %s" % e)
+        except Exception as e:
+            LOG.error("[DATASINK] Flush error: %s" % e)
 
     async def shutdown(self):
         LOG.info("[DATASINK] Shutdown. Final flush...")
         self._shutdown_event.set()
         if self._flush_task:
             self._flush_task.cancel()
-            try: await self._flush_task
-            except asyncio.CancelledError: pass
+            try:
+                await self._flush_task
+            except asyncio.CancelledError:
+                pass
         await self._flush_to_csv()
         if self._conn:
             self._conn.close()
             LOG.info("[DATASINK] Closed.")
-
 
 # =============================================================================
 # MAIN ARBITRAGE ENGINE ORCHESTRATOR
@@ -1381,7 +1565,8 @@ class ArbitrageEngine:
             else:
                 self.exchanges[ec.exchange_id] = ExchangeWebSocketManager(ec, arb_config.symbol)
 
-        if len(self.exchanges) != 2: raise ValueError("Need exactly 2 exchanges.")
+        if len(self.exchanges) != 2:
+            raise ValueError("Need exactly 2 exchanges.")
 
         self._shutdown_event = asyncio.Event()
         self._tasks = []
@@ -1391,10 +1576,13 @@ class ArbitrageEngine:
 
     async def start(self):
         LOG.info("=" * 70)
-        LOG.info("ARBITRAGE ENGINE v5.1 | Mode: %s" % ("DEMO" if self.demo_mode else "LIVE"))
-        LOG.info("Symbol: %s | Vol: %s | Threshold: %s" % (self.config.symbol, self.config.target_volume, self.config.min_yield_threshold))
+        LOG.info("ARBITRAGE ENGINE v5.2 | Mode: %s" % ("DEMO" if self.demo_mode else "LIVE"))
+        LOG.info("Symbol: %s | Vol: %s | Threshold: %s" % (
+            self.config.symbol, self.config.target_volume, self.config.min_yield_threshold))
         LOG.info("Risk: max_trades=%d | max_loss=%s | cooldown=%ds" % (
-            self.risk_config.max_daily_trades, self.risk_config.max_daily_loss, self.risk_config.cooldown_seconds_after_failure))
+            self.risk_config.max_daily_trades,
+            self.risk_config.max_daily_loss,
+            self.risk_config.cooldown_seconds_after_failure))
         LOG.info("Dashboard: http://0.0.0.0:%d/status" % self.health_server.port)
         LOG.info("=" * 70)
 
@@ -1403,8 +1591,10 @@ class ArbitrageEngine:
         await self.ledger.initialize_positions(list(self.exchanges.keys()))
         await self.health_server.start()
 
-        self._tasks.extend([asyncio.create_task(ex.connect(), name="Conn-%s" % ex.exchange_id.value)
-                            for ex in self.exchanges.values()])
+        self._tasks.extend([
+            asyncio.create_task(ex.connect(), name="Conn-%s" % ex.exchange_id.value)
+            for ex in self.exchanges.values()
+        ])
         await asyncio.sleep(1)
 
         self._tasks.append(asyncio.create_task(self._detection_loop(), name="Detector"))
@@ -1421,36 +1611,49 @@ class ArbitrageEngine:
         ex_a_id, ex_b_id = ex_a.exchange_id, ex_b.exchange_id
 
         fee_map = {}
-        for ec in [ExchangeConfig(ExchangeId.BINANCE, "", "", Decimal("0.001")),
-                   ExchangeConfig(ExchangeId.KRAKEN, "", "", Decimal("0.0026"))]:
-            if ec.exchange_id in self.exchanges: fee_map[ec.exchange_id] = ec.taker_fee_rate
+        for ec in [
+            ExchangeConfig(ExchangeId.BINANCE, "", "", Decimal("0.001")),
+            ExchangeConfig(ExchangeId.KRAKEN, "", "", Decimal("0.0026"))
+        ]:
+            if ec.exchange_id in self.exchanges:
+                fee_map[ec.exchange_id] = ec.taker_fee_rate
 
         while not self._shutdown_event.is_set():
             loop_start = time.time_ns()
 
-            if not await self.circuit_breaker.can_trade(): await asyncio.sleep(1.0); continue
-            if not await self.circuit_breaker.check_daily_limits(): await asyncio.sleep(1.0); continue
+            if not await self.circuit_breaker.can_trade():
+                await asyncio.sleep(1.0)
+                continue
+            if not await self.circuit_breaker.check_daily_limits():
+                await asyncio.sleep(1.0)
+                continue
 
             try:
                 book_a = await ex_a.get_order_book()
                 book_b = await ex_b.get_order_book()
-                if book_a is None or book_b is None: await asyncio.sleep(self.poll_interval_ms / 1000.0); continue
+                if book_a is None or book_b is None:
+                    await asyncio.sleep(self.poll_interval_ms / 1000.0)
+                    continue
 
                 sig_ab = PrecisionCalculator.validate_signal(
                     book_a, book_b, self.config,
                     fee_map.get(ex_a_id, Decimal("0.001")),
                     fee_map.get(ex_b_id, Decimal("0.0026")))
                 if sig_ab:
-                    await self.latency_tracker.record_detection((time.time_ns() - loop_start) // 1000)
-                    await self._process_signal(sig_ab); continue
+                    await self.latency_tracker.record_detection(
+                        (time.time_ns() - loop_start) // 1000)
+                    await self._process_signal(sig_ab)
+                    continue
 
                 sig_ba = PrecisionCalculator.validate_signal(
                     book_b, book_a, self.config,
                     fee_map.get(ex_b_id, Decimal("0.0026")),
                     fee_map.get(ex_a_id, Decimal("0.001")))
                 if sig_ba:
-                    await self.latency_tracker.record_detection((time.time_ns() - loop_start) // 1000)
-                    await self._process_signal(sig_ba); continue
+                    await self.latency_tracker.record_detection(
+                        (time.time_ns() - loop_start) // 1000)
+                    await self._process_signal(sig_ba)
+                    continue
 
             except Exception as e:
                 LOG.error("[DETECTOR] %s\n%s" % (e, traceback.format_exc()))
@@ -1458,13 +1661,15 @@ class ArbitrageEngine:
 
             elapsed = time.time_ns() - loop_start
             sleep_ns = max(0, int(self.poll_interval_ms * 1_000_000) - elapsed)
-            if sleep_ns > 0: await asyncio.sleep(sleep_ns / 1_000_000_000.0)
+            if sleep_ns > 0:
+                await asyncio.sleep(sleep_ns / 1_000_000_000.0)
 
     async def _process_signal(self, signal):
         self._signals_detected += 1
         self.data_sink.persist_signal(signal)
-        LOG.info("[SIGNAL] #%d | %s | Net: %s %s" % (self._signals_detected, signal.execution_id,
-                                                      signal.net_profit, signal.symbol.split('/')[1]))
+        LOG.info("[SIGNAL] #%d | %s | Net: %s %s" % (
+            self._signals_detected, signal.execution_id,
+            signal.net_profit, signal.symbol.split('/')[1]))
         try:
             result = await self.execution_router.execute_arbitrage(signal, self.exchanges)
             await self.latency_tracker.record_execution(result.latency_us)
@@ -1475,10 +1680,12 @@ class ArbitrageEngine:
             if result.status == "FILLED":
                 await self.circuit_breaker.record_success(signal.net_profit)
                 self._signals_executed += 1
-                LOG.info("[SIGNAL] #%d EXECUTED in %dus" % (self._signals_detected, result.latency_us))
+                LOG.info("[SIGNAL] #%d EXECUTED in %dus" % (
+                    self._signals_detected, result.latency_us))
             else:
                 await self.circuit_breaker.record_failure(result.status)
-                LOG.warning("[SIGNAL] #%d issue: %s" % (self._signals_detected, result.status))
+                LOG.warning("[SIGNAL] #%d issue: %s" % (
+                    self._signals_detected, result.status))
         except Exception as e:
             LOG.error("[SIGNAL] Exec failed: %s" % e)
             await self.circuit_breaker.record_failure(str(e))
@@ -1486,41 +1693,61 @@ class ArbitrageEngine:
 
     async def _mark_to_market_loop(self):
         while not self._shutdown_event.is_set():
-            try: await asyncio.wait_for(self._shutdown_event.wait(), timeout=5.0)
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(), timeout=5.0)
             except asyncio.TimeoutError:
-                books = {ex_id: await m.get_order_book() for ex_id, m in self.exchanges.items()}
+                books = {
+                    ex_id: await m.get_order_book()
+                    for ex_id, m in self.exchanges.items()
+                }
                 books = {k: v for k, v in books.items() if v}
-                if books: await self.ledger.mark_to_market(books)
+                if books:
+                    await self.ledger.mark_to_market(books)
 
     async def _metrics_snapshot_loop(self):
         while not self._shutdown_event.is_set():
-            try: await asyncio.wait_for(self._shutdown_event.wait(), timeout=2.0)
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(), timeout=2.0)
             except asyncio.TimeoutError:
                 await self.metrics_history.snapshot(self)
 
     async def _status_reporter(self):
         while not self._shutdown_event.is_set():
-            try: await asyncio.wait_for(self._shutdown_event.wait(), timeout=10.0)
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(), timeout=10.0)
             except asyncio.TimeoutError:
                 for ex_id, m in self.exchanges.items():
-                    LOG.info("[HEALTH] %s: %s | Msgs:%d" % (ex_id.value, "CONN" if m.is_connected else "DISC", m.messages_received))
+                    LOG.info("[HEALTH] %s: %s | Msgs:%d" % (
+                        ex_id.value,
+                        "CONN" if m.is_connected else "DISC",
+                        m.messages_received))
                 rate = self._signals_executed / max(self._signals_detected, 1) * 100
                 lat = self.latency_tracker.get_metrics()
                 exec_p99 = lat["execution_us"]["p99"]
                 LOG.info("[METRICS] Sig:%d | Exec:%d | Rate:%.1f%% | Exec p99:%.0fus | P&L:%s" % (
-                    self._signals_detected, self._signals_executed, rate, exec_p99,
+                    self._signals_detected,
+                    self._signals_executed,
+                    rate,
+                    exec_p99,
                     self.ledger.get_metrics()["total_realized_pnl"]))
 
     async def shutdown(self):
         LOG.info("[ENGINE] Shutdown...")
         self._shutdown_event.set()
         for task in self._tasks:
-            if not task.done(): task.cancel()
-        if self._tasks: await asyncio.gather(*self._tasks, return_exceptions=True)
-        for m in self.exchanges.values(): await m.shutdown()
+            if not task.done():
+                task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        for m in self.exchanges.values():
+            await m.shutdown()
         await self.data_sink.shutdown()
         await self.health_server.shutdown()
         LOG.info("[ENGINE] Done.")
+
 
 # =============================================================================
 # SIGNAL HANDLERS & MAIN
@@ -1541,14 +1768,16 @@ class SignalHandler:
             LOG.warning("[SIGNAL] Not supported on this platform.")
 
     def _handle(self, sig):
-        if self._received: LOG.warning("[SIGNAL] Forced exit."); sys.exit(1)
+        if self._received:
+            LOG.warning("[SIGNAL] Forced exit.")
+            sys.exit(1)
         self._received = True
         LOG.info("[SIGNAL] %s received. Graceful shutdown..." % signal.Signals(sig).name)
         asyncio.create_task(self.engine.shutdown())
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Spatial Arbitrage Engine v5.1")
+    parser = argparse.ArgumentParser(description="Spatial Arbitrage Engine v5.2")
     parser.add_argument("--live", action="store_true", help="LIVE mode (needs API keys)")
     parser.add_argument("--duration", type=int, default=120, help="Demo duration in seconds")
     parser.add_argument("--db", default="arbitrage_engine.db", help="SQLite path")
@@ -1560,13 +1789,18 @@ async def main():
     demo_mode = not args.live
 
     arb_config = ArbitrageConfig(
-        symbol="BTC/USDT", target_volume=Decimal("0.01"),
-        min_yield_threshold=Decimal("5.00"), estimated_gas_fee=Decimal("2.50"),
-        max_slippage_tolerance=Decimal("0.005"), vwap_depth_limit=20)
+        symbol="BTC/USDT",
+        target_volume=Decimal("0.01"),
+        min_yield_threshold=Decimal("5.00"),
+        estimated_gas_fee=Decimal("2.50"),
+        max_slippage_tolerance=Decimal("0.005"),
+        vwap_depth_limit=20)
 
     risk_config = RiskConfig(
-        max_daily_trades=1000, max_daily_loss=Decimal("1000.00"),
-        max_consecutive_failures=5, cooldown_seconds_after_failure=30,
+        max_daily_trades=1000,
+        max_daily_loss=Decimal("1000.00"),
+        max_consecutive_failures=5,
+        cooldown_seconds_after_failure=30,
         circuit_breaker_drawdown_pct=Decimal("0.05"))
 
     if demo_mode:
@@ -1577,19 +1811,33 @@ async def main():
     else:
         LOG.info("[MAIN] LIVE MODE.")
         exchange_configs = [
-            ExchangeConfig(ExchangeId.BINANCE, os.environ.get("BINANCE_API_KEY", ""),
-                           os.environ.get("BINANCE_API_SECRET", ""), Decimal("0.001"), True),
-            ExchangeConfig(ExchangeId.KRAKEN, os.environ.get("KRAKEN_API_KEY", ""),
-                           os.environ.get("KRAKEN_API_SECRET", ""), Decimal("0.0026"), True)]
+            ExchangeConfig(
+                ExchangeId.BINANCE,
+                os.environ.get("BINANCE_API_KEY", ""),
+                os.environ.get("BINANCE_API_SECRET", ""),
+                Decimal("0.001"), True),
+            ExchangeConfig(
+                ExchangeId.KRAKEN,
+                os.environ.get("KRAKEN_API_KEY", ""),
+                os.environ.get("KRAKEN_API_SECRET", ""),
+                Decimal("0.0026"), True)]
 
-    data_sink = DataSink(db_path=args.db, csv_path=args.csv, flush_interval_seconds=10)
+    data_sink = DataSink(
+        db_path=args.db,
+        csv_path=args.csv,
+        flush_interval_seconds=10)
     execution_router = ExecutionRouter(sandbox=True)
 
     engine = ArbitrageEngine(
-        arb_config=arb_config, exchange_configs=exchange_configs,
-        data_sink=data_sink, execution_router=execution_router,
-        risk_config=risk_config, poll_interval_ms=10.0,
-        demo_mode=demo_mode, webhook_url=args.webhook, health_port=args.port)
+        arb_config=arb_config,
+        exchange_configs=exchange_configs,
+        data_sink=data_sink,
+        execution_router=execution_router,
+        risk_config=risk_config,
+        poll_interval_ms=10.0,
+        demo_mode=demo_mode,
+        webhook_url=args.webhook,
+        health_port=args.port)
 
     SignalHandler(engine).register()
 
@@ -1612,4 +1860,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        LOG.info("[MAIN] Interrupted."); sys.exit(0)
+        LOG.info("[MAIN] Interrupted.")
+        sys.exit(0)
