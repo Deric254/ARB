@@ -1,27 +1,22 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-SPATIAL ARBITRAGE TRADING ENGINE — PRODUCTION v5.1
-High-Frequency Cryptocurrency Arbitrage System
+SPATIAL ARBITRAGE ENGINE PRO v6.0 — FULL DASHBOARD EDITION
 ================================================================================
-
-ZERO-GAP ARCHITECTURE with REAL-TIME CHART DASHBOARD + SLICERS:
- - Live Chart.js dashboard with auto-refresh
- - KPI cards: P&L, Success Rate, Latency, Signals/min, Trades, Spread
- - Real-time charts: P&L over time, Execution Latency (p50/p99),
-   Signal Rate, Exchange Spreads, Price Divergence
- - INTERACTIVE SLICERS: Time Range, Profit Filter, Exchange Pair, Status, Refresh Rate
- - Trade Log Table with live filtering
- - Circuit Breaker, P&L Ledger, Latency Telemetry, Webhook Alerts
- - Synthetic DEMO mode + LIVE WebSocket mode
+Features:
+  - Live Chart.js dashboard with 6 charts, 5 slicers, KPI cards
+  - Trade Log table with live filtering
+  - Circuit Breaker badge & state tracking
+  - DEMO mode (no API keys), PAPER mode, LIVE mode
+  - Real-time P&L, latency telemetry, signal rate tracking
+  - SQLite + CSV persistence
 
 Usage:
- python arbitrage_engine.py              # DEMO mode, 120s, auto-opens browser
- python arbitrage_engine.py --live       # LIVE mode (requires API keys)
- python arbitrage_engine.py --duration 300 --port 8080
+  python arbitrage_engine.py              # DEMO mode
+  python arbitrage_engine.py --live       # LIVE mode (needs .env)
 
-Requirements:
- pip install ccxt aiofiles
+Dashboard: http://localhost:8765/status
+================================================================================
 """
 
 import asyncio
@@ -32,1833 +27,1203 @@ import sqlite3
 import os
 import json
 import logging
-import traceback
+import csv
 import random
 import argparse
-import urllib.request
-from decimal import Decimal, ROUND_HALF_UP, getcontext
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple, Any
+import traceback
+from decimal import Decimal
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 from collections import deque
 
-getcontext().prec = 50
-
 try:
-    import ccxt.pro as ccxtpro
+    import ccxt.pro as ccxt
+    CCXT_OK = True
 except ImportError:
     try:
-        import ccxt.async_support as ccxtpro
+        import ccxt.async_support as ccxt
+        CCXT_OK = True
     except ImportError:
-        ccxtpro = None
+        CCXT_OK = False
 
 try:
-    import aiofiles
+    from aiohttp import web
+    AIOHTTP_OK = True
 except ImportError:
-    raise ImportError("pip install aiofiles")
+    AIOHTTP_OK = False
 
-# =============================================================================
-# CONFIGURATION & DATA STRUCTURES
-# =============================================================================
-
-class TradeSide(Enum):
+# ------------------------------------------------------------------------------
+# CONFIG
+# ------------------------------------------------------------------------------
+class Side(Enum):
     BUY = "buy"
     SELL = "sell"
 
-class ExchangeId(Enum):
-    BINANCE = "binance"
-    KRAKEN = "kraken"
-
-class AlertLevel(Enum):
+class AlertLvl(Enum):
     INFO = "info"
     WARNING = "warning"
     CRITICAL = "critical"
-    EXECUTION = "execution"
+    EXEC = "execution"
 
 @dataclass(frozen=True)
-class ExchangeConfig:
-    exchange_id: ExchangeId
-    api_key: str
-    api_secret: str
-    taker_fee_rate: Decimal
-    sandbox: bool = True
-    def __post_init__(self):
-        fee = Decimal(str(self.taker_fee_rate)).quantize(Decimal("0.00000001"))
-        object.__setattr__(self, 'taker_fee_rate', fee)
+class ExCfg:
+    name: str
+    key: str
+    secret: str
+    passphrase: str = ""
+    taker: Decimal = Decimal("0.001")
+    demo: bool = False
 
 @dataclass(frozen=True)
-class ArbitrageConfig:
+class ArbCfg:
     symbol: str
-    target_volume: Decimal
-    min_yield_threshold: Decimal
-    estimated_gas_fee: Decimal
-    max_slippage_tolerance: Decimal
-    vwap_depth_limit: int = 20
-    def __post_init__(self):
-        object.__setattr__(self, 'target_volume', Decimal(str(self.target_volume)))
-        object.__setattr__(self, 'min_yield_threshold', Decimal(str(self.min_yield_threshold)))
-        object.__setattr__(self, 'estimated_gas_fee', Decimal(str(self.estimated_gas_fee)))
-        object.__setattr__(self, 'max_slippage_tolerance', Decimal(str(self.max_slippage_tolerance)))
+    vol: Decimal
+    min_profit: Decimal
+    gas: Decimal
+    max_slip: Decimal
+    vwap_depth: int = 20
 
 @dataclass(frozen=True)
-class RiskConfig:
-    max_daily_trades: int = 1000
-    max_daily_loss: Decimal = Decimal("500.00")
-    max_consecutive_failures: int = 5
-    cooldown_seconds_after_failure: int = 30
-    max_open_position_value: Decimal = Decimal("100000.00")
-    circuit_breaker_drawdown_pct: Decimal = Decimal("0.02")
+class RiskCfg:
+    max_trades: int = 50
+    max_loss: Decimal = Decimal("500")
+    max_fail: int = 5
+    cooldown: int = 30
+    drawdown_pct: Decimal = Decimal("0.05")
 
 @dataclass
-class OrderBookLevel:
+class OBLevel:
     price: Decimal
-    volume: Decimal
-    def __post_init__(self):
-        if isinstance(self.price, (int, float, str)):
-            object.__setattr__(self, 'price', Decimal(str(self.price)))
-        if isinstance(self.volume, (int, float, str)):
-            object.__setattr__(self, 'volume', Decimal(str(self.volume)))
+    amount: Decimal
 
 @dataclass
-class OrderBookSnapshot:
-    exchange_id: ExchangeId
-    symbol: str
-    timestamp_ns: int
-    bids: List[OrderBookLevel] = field(default_factory=list)
-    asks: List[OrderBookLevel] = field(default_factory=list)
-    @property
+class OB:
+    bids: List[OBLevel]
+    asks: List[OBLevel]
+    ts: int
     def best_bid(self): return self.bids[0].price if self.bids else None
-    @property
     def best_ask(self): return self.asks[0].price if self.asks else None
-    @property
-    def mid_price(self):
-        bb, ba = self.best_bid, self.best_ask
-        if bb is not None and ba is not None:
-            return ((bb + ba) / Decimal("2")).quantize(Decimal("0.01"))
-        return None
-    @property
+    def mid(self):
+        b, a = self.best_bid(), self.best_ask()
+        return (b + a) / 2 if b and a else None
     def spread_bps(self):
-        bb, ba = self.best_bid, self.best_ask
-        if bb is not None and ba is not None and bb > Decimal("0"):
-            return ((ba - bb) / bb * Decimal("10000")).quantize(Decimal("0.01"))
-        return None
+        b, a = self.best_bid(), self.best_ask()
+        return ((a - b) / ((a + b) / 2) * 10000) if b and a else Decimal("0")
 
 @dataclass
-class VWAPResult:
-    vwap: Decimal
-    executable_volume: Decimal
-    levels_consumed: int
-    slippage_from_top: Decimal
-    fully_filled: bool
-
-@dataclass
-class ArbitrageSignal:
-    timestamp_ns: int
+class ArbSig:
+    eid: str
+    buy_ex: str
+    sell_ex: str
     symbol: str
-    buy_exchange: ExchangeId
-    sell_exchange: ExchangeId
     buy_vwap: Decimal
     sell_vwap: Decimal
-    target_volume: Decimal
-    gross_spread: Decimal
-    buy_fee: Decimal
-    sell_fee: Decimal
-    gas_fee: Decimal
+    target_vol: Decimal
     net_profit: Decimal
-    net_profit_pct: Decimal
-    execution_id: str
+    buy_slip: Decimal
+    sell_slip: Decimal
+    ts_ns: int
 
 @dataclass
-class ExecutionResult:
-    execution_id: str
-    timestamp_ns: int
-    buy_exchange: ExchangeId
-    sell_exchange: ExchangeId
-    buy_order_id: Optional[str]
-    sell_order_id: Optional[str]
-    buy_fill_price: Optional[Decimal]
-    sell_fill_price: Optional[Decimal]
-    filled_volume: Decimal
+class ExecRes:
+    eid: str
+    ts_ns: int
+    buy_ex: str
+    sell_ex: str
+    buy_oid: Optional[str]
+    sell_oid: Optional[str]
+    buy_fill_px: Optional[Decimal]
+    sell_fill_px: Optional[Decimal]
+    filled_vol: Decimal
     status: str
     latency_us: int
-    error_message: Optional[str] = None
+    err: Optional[str] = None
 
 @dataclass
 class Position:
-    exchange_id: ExchangeId
-    symbol: str
-    base_asset: Decimal = Decimal("0")
-    quote_asset: Decimal = Decimal("0")
-    avg_entry_price: Optional[Decimal] = None
-    realized_pnl: Decimal = Decimal("0")
-    unrealized_pnl: Decimal = Decimal("0")
-    trade_count: int = 0
+    ex: str
+    asset: str
+    qty: Decimal = Decimal("0")
+    avg_px: Decimal = Decimal("0")
 
-# =============================================================================
+# ------------------------------------------------------------------------------
 # LOGGING
-# =============================================================================
-
-class MicrosecondFormatter(logging.Formatter):
+# ------------------------------------------------------------------------------
+class MicroFormatter(logging.Formatter):
     def formatTime(self, record, datefmt=None):
-        ct = datetime.fromtimestamp(record.created, tz=timezone.utc)
-        t = ct.strftime("%Y-%m-%d %H:%M:%S")
-        return "%s.%06d" % (t, int(record.msecs * 1000))
+        return datetime.fromtimestamp(record.created).strftime("%H:%M:%S.") + "%06d" % int((record.created % 1) * 1e6)
 
-def setup_logging(log_level=logging.INFO):
-    logger = logging.getLogger("ArbitrageEngine")
-    logger.setLevel(log_level)
-    if not logger.handlers:
-        h = logging.StreamHandler(sys.stdout)
-        h.setLevel(log_level)
-        h.setFormatter(MicrosecondFormatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"))
-        logger.addHandler(h)
-    return logger
+def setup_log(level=logging.INFO):
+    h = logging.StreamHandler(sys.stdout)
+    h.setFormatter(MicroFormatter("%(asctime)s | %(levelname)-8s | %(message)s"))
+    logging.getLogger().handlers = []
+    logging.getLogger().addHandler(h)
+    logging.getLogger().setLevel(level)
 
-LOG = setup_logging()
+LOG = logging.getLogger("ARB")
 
-# =============================================================================
-# HIGH-PRECISION CALCULATION ENGINE
-# =============================================================================
+# ------------------------------------------------------------------------------
+# LOAD .ENV
+# ------------------------------------------------------------------------------
+def load_env(path=".env"):
+    if not os.path.exists(path):
+        return {}
+    vals = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            vals[k.strip()] = v.strip()
+    return vals
 
-class PrecisionCalculator:
+ENV = load_env()
+
+# ------------------------------------------------------------------------------
+# PRECISION CALCULATOR
+# ------------------------------------------------------------------------------
+class Calc:
     @staticmethod
-    def compute_vwap(levels, target_volume, depth_limit=20):
-        if not levels or target_volume <= Decimal("0"):
-            return VWAPResult(Decimal("0"), Decimal("0"), 0, Decimal("0"), False)
-        remaining = target_volume
-        cum_val = Decimal("0")
-        cum_vol = Decimal("0")
-        top_price = levels[0].price
-        levels_consumed = 0
-        for level in levels[:depth_limit]:
-            if remaining <= Decimal("0"): break
-            take = min(level.volume, remaining)
-            cum_val += take * level.price
-            cum_vol += take
-            remaining -= take
-            levels_consumed += 1
-        if cum_vol <= Decimal("0"):
-            return VWAPResult(Decimal("0"), Decimal("0"), 0, Decimal("0"), False)
-        vwap = (cum_val / cum_vol).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
-        slippage = abs(((vwap - top_price) / top_price).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)) if top_price != Decimal("0") else Decimal("0")
-        return VWAPResult(vwap, cum_vol, levels_consumed, slippage, remaining <= Decimal("0"))
+    def vwap(levels: List[OBLevel], target: Decimal, depth: int = 20) -> Tuple[Decimal, Decimal]:
+        if not levels:
+            return Decimal("0"), Decimal("999")
+        cost = Decimal("0")
+        vol = Decimal("0")
+        for lv in levels[:depth]:
+            v = min(lv.amount, target - vol)
+            cost += v * lv.price
+            vol += v
+            if vol >= target:
+                break
+        if vol == 0:
+            return Decimal("0"), Decimal("999")
+        vw = cost / vol
+        slip = ((vw - levels[0].price).abs() / levels[0].price * 100) if levels[0].price > 0 else Decimal("999")
+        return vw, slip
 
     @staticmethod
-    def calculate_net_spread(buy_vwap, sell_vwap, buy_taker_fee, sell_taker_fee, gas_fee, target_volume):
-        buy_cost = buy_vwap * target_volume * (Decimal("1") + buy_taker_fee)
-        sell_revenue = sell_vwap * target_volume * (Decimal("1") - sell_taker_fee)
-        gross = sell_revenue - buy_cost
-        net = gross - gas_fee
-        net_pct = (net / buy_cost).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP) if buy_cost > Decimal("0") else Decimal("0")
-        return gross, net, net_pct
+    def net_spread(buy_vwap, sell_vwap, buy_fee, sell_fee, gas, vol) -> Decimal:
+        buy_cost = vol * buy_vwap * (Decimal("1") + buy_fee)
+        sell_rev = vol * sell_vwap * (Decimal("1") - sell_fee)
+        return sell_rev - buy_cost - gas
 
     @staticmethod
-    def validate_signal(buy_book, sell_book, config, buy_fee, sell_fee):
-        buy_vwap = PrecisionCalculator.compute_vwap(buy_book.asks, config.target_volume, config.vwap_depth_limit)
-        sell_vwap = PrecisionCalculator.compute_vwap(sell_book.bids, config.target_volume, config.vwap_depth_limit)
-        if not buy_vwap.fully_filled or not sell_vwap.fully_filled: return None
-        if buy_vwap.slippage_from_top > config.max_slippage_tolerance or sell_vwap.slippage_from_top > config.max_slippage_tolerance: return None
-        gross, net, net_pct = PrecisionCalculator.calculate_net_spread(buy_vwap.vwap, sell_vwap.vwap, buy_fee, sell_fee, config.estimated_gas_fee, config.target_volume)
-        if net <= config.min_yield_threshold: return None
-        eid = "ARB-%s" % datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')[:-3]
-        return ArbitrageSignal(
-            timestamp_ns=time.time_ns(), symbol=config.symbol,
-            buy_exchange=buy_book.exchange_id, sell_exchange=sell_book.exchange_id,
-            buy_vwap=buy_vwap.vwap, sell_vwap=sell_vwap.vwap, target_volume=config.target_volume,
-            gross_spread=gross.quantize(Decimal("0.00000001")),
-            buy_fee=(buy_vwap.vwap * config.target_volume * buy_fee).quantize(Decimal("0.00000001")),
-            sell_fee=(sell_vwap.vwap * config.target_volume * sell_fee).quantize(Decimal("0.00000001")),
-            gas_fee=config.estimated_gas_fee, net_profit=net.quantize(Decimal("0.00000001")),
-            net_profit_pct=net_pct, execution_id=eid)
+    def validate(buy_book: OB, sell_book: OB, cfg: ArbCfg, buy_fee: Decimal, sell_fee: Decimal) -> Optional[ArbSig]:
+        buy_vwap, buy_slip = Calc.vwap(buy_book.asks, cfg.vol, cfg.vwap_depth)
+        sell_vwap, sell_slip = Calc.vwap(sell_book.bids, cfg.vol, cfg.vwap_depth)
+        if buy_vwap == 0 or sell_vwap == 0:
+            return None
+        if buy_slip > cfg.max_slip or sell_slip > cfg.max_slip:
+            return None
+        profit = Calc.net_spread(buy_vwap, sell_vwap, buy_fee, sell_fee, cfg.gas, cfg.vol)
+        if profit <= cfg.min_profit:
+            return None
+        eid = "ARB-%s" % time.time_ns()
+        return ArbSig(eid, "", "", cfg.symbol, buy_vwap, sell_vwap, cfg.vol, profit, buy_slip, sell_slip, time.time_ns())
 
-# =============================================================================
+# ------------------------------------------------------------------------------
 # CIRCUIT BREAKER
-# =============================================================================
-
+# ------------------------------------------------------------------------------
 class CircuitBreaker:
-    def __init__(self, risk_config):
-        self.risk_config = risk_config
+    def __init__(self, risk: RiskCfg):
+        self.risk = risk
         self._state = "CLOSED"
-        self._consecutive_failures = 0
+        self._reason = ""
         self._daily_trades = 0
-        self._daily_pnl = Decimal("0")
-        self._last_failure_time = 0
+        self._daily_loss = Decimal("0")
+        self._consec_fail = 0
+        self._last_fail = 0.0
+        self._peak_pnl = Decimal("0")
+        self._cur_pnl = Decimal("0")
+        self._day_start = time.time()
         self._lock = asyncio.Lock()
-        self._opened_at = None
-        self._open_reason = None
 
-    @property
-    def state(self): return self._state
-    @property
-    def open_reason(self): return self._open_reason
-
-    async def can_trade(self):
+    async def can_trade(self) -> bool:
         async with self._lock:
+            if time.time() - self._day_start > 86400:
+                self._daily_trades = 0
+                self._daily_loss = Decimal("0")
+                self._day_start = time.time()
+                self._state = "CLOSED"
+                self._reason = ""
             if self._state == "OPEN":
-                if time.time() - self._last_failure_time > self.risk_config.cooldown_seconds_after_failure:
-                    self._state = "CLOSED"; self._consecutive_failures = 0
-                return True
-            return False
-        return True
-
-    async def record_success(self, net_profit):
-        async with self._lock:
-            self._consecutive_failures = 0
-            self._daily_trades += 1
-            self._daily_pnl += net_profit
-
-    async def record_failure(self, reason=""):
-        async with self._lock:
-            self._consecutive_failures += 1
-            self._last_failure_time = time.time()
-            if self._consecutive_failures >= self.risk_config.max_consecutive_failures:
-                self._open_circuit("Max consecutive failures: %d" % self._consecutive_failures)
-
-    async def check_daily_limits(self):
-        async with self._lock:
-            if self._daily_trades >= self.risk_config.max_daily_trades:
-                self._open_circuit("Daily trade limit: %d" % self._daily_trades); return False
-            if self._daily_pnl <= -self.risk_config.max_daily_loss:
-                self._open_circuit("Daily loss limit: %s" % self._daily_pnl); return False
+                return False
+            if self._daily_trades >= self.risk.max_trades:
+                self._open("Daily trade limit reached")
+                return False
+            if self._daily_loss >= self.risk.max_loss:
+                self._open("Daily loss limit reached")
+                return False
+            if self._consec_fail >= self.risk.max_fail and (time.time() - self._last_fail) < self.risk.cooldown:
+                return False
+            if self._consec_fail >= self.risk.max_fail:
+                self._consec_fail = 0
+            if self._cur_pnl < self._peak_pnl:
+                dd = (self._peak_pnl - self._cur_pnl) / max(self._peak_pnl, Decimal("1"))
+                if dd > self.risk.drawdown_pct:
+                    self._open("Max drawdown reached")
+                    return False
             return True
 
-    def _open_circuit(self, reason):
-        self._state = "OPEN"; self._opened_at = datetime.now(timezone.utc); self._open_reason = reason
-        LOG.critical("[CIRCUIT] BREAKER OPENED: %s" % reason)
+    def _open(self, reason: str):
+        self._state = "OPEN"
+        self._reason = reason
+        LOG.critical("CIRCUIT BREAKER OPEN: %s", reason)
 
-    def get_metrics(self):
-        return {"state": self._state, "open_reason": self._open_reason,
-                "opened_at": self._opened_at.isoformat() if self._opened_at else None,
-                "consecutive_failures": self._consecutive_failures,
-                "daily_trades": self._daily_trades, "daily_pnl": str(self._daily_pnl)}
+    async def record_success(self, profit: Decimal):
+        async with self._lock:
+            self._daily_trades += 1
+            self._cur_pnl += profit
+            if self._cur_pnl > self._peak_pnl:
+                self._peak_pnl = self._cur_pnl
+            self._consec_fail = 0
 
-# =============================================================================
-# LATENCY TELEMETRY
-# =============================================================================
+    async def record_failure(self, reason: str):
+        async with self._lock:
+            self._consec_fail += 1
+            self._last_fail = time.time()
 
+    def state(self): return self._state
+    def reason(self): return self._reason
+    def metrics(self):
+        return {
+            "state": self._state,
+            "reason": self._reason,
+            "daily_trades": self._daily_trades,
+            "daily_loss": str(self._daily_loss),
+            "cur_pnl": str(self._cur_pnl),
+            "peak_pnl": str(self._peak_pnl),
+            "consec_fail": self._consec_fail
+        }
+
+# ------------------------------------------------------------------------------
+# LATENCY TRACKER
+# ------------------------------------------------------------------------------
 class LatencyTracker:
-    def __init__(self, window_size=1000):
-        self._detection_us = deque(maxlen=window_size)
-        self._execution_us = deque(maxlen=window_size)
-        self._lock = asyncio.Lock()
+    def __init__(self, window=1000):
+        self._det = deque(maxlen=window)
+        self._exec = deque(maxlen=window)
 
-    async def record_detection(self, latency_us):
-        async with self._lock: self._detection_us.append(latency_us)
-    async def record_execution(self, latency_us):
-        async with self._lock: self._execution_us.append(latency_us)
+    async def record_detection(self, us: int):
+        self._det.append(us)
+
+    async def record_execution(self, us: int):
+        self._exec.append(us)
 
     def _pct(self, data, p):
-        if not data: return 0.0
-        s = sorted(data); k = (len(s) - 1) * p; f = int(k); c = min(f + 1, len(s) - 1)
-        return s[f] + (k - f) * (s[c] - s[f]) if c != f else s[f]
+        if not data:
+            return 0
+        s = sorted(data)
+        idx = int(len(s) * p / 100)
+        return s[min(idx, len(s)-1)]
 
-    def _stats(self, data):
-        if not data: return {"count": 0, "min": 0, "max": 0, "avg": 0, "p50": 0, "p99": 0}
-        return {"count": len(data), "min": min(data), "max": max(data),
-                "avg": sum(data) / len(data), "p50": self._pct(data, 0.50), "p99": self._pct(data, 0.99)}
+    def metrics(self):
+        return {
+            "detection_us": {"p50": self._pct(self._det, 50), "p99": self._pct(self._det, 99), "count": len(self._det)},
+            "execution_us": {"p50": self._pct(self._exec, 50), "p99": self._pct(self._exec, 99), "count": len(self._exec)}
+        }
 
-    def get_metrics(self):
-        return {"detection_us": self._stats(self._detection_us), "execution_us": self._stats(self._execution_us)}
-
-# =============================================================================
+# ------------------------------------------------------------------------------
 # P&L LEDGER
-# =============================================================================
-
-class ProfitLossLedger:
-    def __init__(self, symbol):
+# ------------------------------------------------------------------------------
+class PnLLedger:
+    def __init__(self, symbol: str):
         self.symbol = symbol
-        self.base_asset, self.quote_asset = symbol.split("/")
-        self.positions = {}
+        self._realized = Decimal("0")
+        self._unrealized = Decimal("0")
+        self._positions: Dict[str, Position] = {}
         self._lock = asyncio.Lock()
-        self._total_realized_pnl = Decimal("0")
-        self._total_unrealized_pnl = Decimal("0")
-        self._trade_history = []
 
-    async def initialize_positions(self, exchange_ids, initial_base=Decimal("1.0"), initial_quote=Decimal("100000.0")):
+    async def init_positions(self, exchanges: List[str]):
+        base = self.symbol.split("/")[0]
+        for ex in exchanges:
+            self._positions["%s:%s" % (ex, base)] = Position(ex, base)
+
+    async def record_exec(self, res: ExecRes, sig: ArbSig):
         async with self._lock:
-            for ex_id in exchange_ids:
-                self.positions[ex_id] = Position(exchange_id=ex_id, symbol=self.symbol,
-                                                 base_asset=initial_base, quote_asset=initial_quote)
-            LOG.info("[LEDGER] Positions initialized.")
+            if res.status == "FILLED" and res.buy_fill_px and res.sell_fill_px:
+                pnl = (res.sell_fill_px - res.buy_fill_px) * res.filled_vol
+                self._realized += pnl
 
-    async def record_execution(self, result, signal):
+    async def mtm(self, books: Dict[str, OB]):
         async with self._lock:
-            if result.status != "FILLED": return
-            buy_pos = self.positions[result.buy_exchange]
-            sell_pos = self.positions[result.sell_exchange]
-            buy_pos.quote_asset -= signal.buy_vwap * signal.target_volume
-            buy_pos.base_asset += signal.target_volume
-            buy_pos.trade_count += 1
-            sell_pos.base_asset -= signal.target_volume
-            sell_pos.quote_asset += signal.sell_vwap * signal.target_volume
-            sell_pos.trade_count += 1
-            self._total_realized_pnl += signal.net_profit
-            self._trade_history.append({"timestamp": datetime.now(timezone.utc).isoformat(),
-                                        "execution_id": result.execution_id, "net_profit": str(signal.net_profit),
-                                        "latency_us": result.latency_us, "status": result.status,
-                                        "buy_exchange": result.buy_exchange.value, "sell_exchange": result.sell_exchange.value,
-                                        "buy_vwap": str(signal.buy_vwap), "sell_vwap": str(signal.sell_vwap),
-                                        "target_volume": str(signal.target_volume)})
-            LOG.info("[LEDGER] P&L: %s | Total: %s" % (signal.net_profit, self._total_realized_pnl))
+            base = self.symbol.split("/")[0]
+            self._unrealized = Decimal("0")
+            for ex, ob in books.items():
+                mid = ob.mid()
+                if mid:
+                    pos = self._positions.get("%s:%s" % (ex, base))
+                    if pos:
+                        self._unrealized += pos.qty * mid
 
-    async def mark_to_market(self, exchange_books):
-        async with self._lock:
-            total = Decimal("0")
-            for ex_id, pos in self.positions.items():
-                book = exchange_books.get(ex_id)
-                if book and book.mid_price and pos.base_asset > Decimal("0"):
-                    pos.unrealized_pnl = pos.base_asset * book.mid_price
-                total += pos.unrealized_pnl
-            self._total_unrealized_pnl = total
+    def metrics(self):
+        return {"total_realized_pnl": str(self._realized), "unrealized": str(self._unrealized)}
 
-    def get_metrics(self):
-        return {"total_realized_pnl": str(self._total_realized_pnl),
-                "total_unrealized_pnl": str(self._total_unrealized_pnl),
-                "total_pnl": str(self._total_realized_pnl + self._total_unrealized_pnl),
-                "positions": {k.value: {"base": str(v.base_asset), "quote": str(v.quote_asset),
-                                        "trades": v.trade_count, "unrealized": str(v.unrealized_pnl)}
-                              for k, v in self.positions.items()},
-                "trade_count": len(self._trade_history),
-                "trade_history": list(self._trade_history)}
-
-# =============================================================================
+# ------------------------------------------------------------------------------
 # METRICS HISTORY
-# =============================================================================
-
+# ------------------------------------------------------------------------------
 class MetricsHistory:
-    def __init__(self, max_points=300):
-        self.max_points = max_points
-        self._timestamps = deque(maxlen=max_points)
-        self._realized_pnl = deque(maxlen=max_points)
-        self._exec_latency_p50 = deque(maxlen=max_points)
-        self._exec_latency_p99 = deque(maxlen=max_points)
-        self._detection_latency_avg = deque(maxlen=max_points)
-        self._signals_detected = deque(maxlen=max_points)
-        self._signals_executed = deque(maxlen=max_points)
-        self._binance_spread_bps = deque(maxlen=max_points)
-        self._kraken_spread_bps = deque(maxlen=max_points)
-        self._binance_mid = deque(maxlen=max_points)
-        self._kraken_mid = deque(maxlen=max_points)
-        self._circuit_state = deque(maxlen=max_points)
+    def __init__(self, max_pts=300):
+        self._max = max_pts
+        self._ts = deque(maxlen=max_pts)
+        self._pnl = deque(maxlen=max_pts)
+        self._det_lat_p50 = deque(maxlen=max_pts)
+        self._det_lat_p99 = deque(maxlen=max_pts)
+        self._exec_lat_p50 = deque(maxlen=max_pts)
+        self._exec_lat_p99 = deque(maxlen=max_pts)
+        self._sig_det = deque(maxlen=max_pts)
+        self._sig_exec = deque(maxlen=max_pts)
+        self._spread_a = deque(maxlen=max_pts)
+        self._spread_b = deque(maxlen=max_pts)
+        self._price_a = deque(maxlen=max_pts)
+        self._price_b = deque(maxlen=max_pts)
+        self._circuit = deque(maxlen=max_pts)
         self._lock = asyncio.Lock()
 
     async def snapshot(self, engine):
         async with self._lock:
-            now = datetime.now(timezone.utc).strftime("%H:%M:%S")
-            self._timestamps.append(now)
-            lat = engine.latency_tracker.get_metrics()
-            pnl = engine.ledger.get_metrics()
-            circ = engine.circuit_breaker.get_metrics()
-            self._realized_pnl.append(float(pnl["total_realized_pnl"]))
-            self._exec_latency_p50.append(lat["execution_us"]["p50"])
-            self._exec_latency_p99.append(lat["execution_us"]["p99"])
-            self._detection_latency_avg.append(lat["detection_us"]["avg"])
-            self._signals_detected.append(engine._signals_detected)
-            self._signals_executed.append(engine._signals_executed)
-            self._circuit_state.append(1 if circ["state"] == "CLOSED" else 0)
-            books = {}
-            for ex_id, mgr in engine.exchanges.items():
-                try:
-                    b = mgr._order_book
-                    if b: books[ex_id] = b
-                except: pass
-            b_spread = float(books.get(ExchangeId.BINANCE, OrderBookSnapshot(ExchangeId.BINANCE, "", 0)).spread_bps or 0)
-            k_spread = float(books.get(ExchangeId.KRAKEN, OrderBookSnapshot(ExchangeId.KRAKEN, "", 0)).spread_bps or 0)
-            b_mid = float(books.get(ExchangeId.BINANCE, OrderBookSnapshot(ExchangeId.BINANCE, "", 0)).mid_price or 0)
-            k_mid = float(books.get(ExchangeId.KRAKEN, OrderBookSnapshot(ExchangeId.KRAKEN, "", 0)).mid_price or 0)
-            self._binance_spread_bps.append(b_spread)
-            self._kraken_spread_bps.append(k_spread)
-            self._binance_mid.append(b_mid)
-            self._kraken_mid.append(k_mid)
-
-    def get_chart_data(self):
-        return {
-            "timestamps": list(self._timestamps),
-            "realized_pnl": list(self._realized_pnl),
-            "exec_latency_p50": list(self._exec_latency_p50),
-            "exec_latency_p99": list(self._exec_latency_p99),
-            "detection_latency_avg": list(self._detection_latency_avg),
-            "signals_detected": list(self._signals_detected),
-            "signals_executed": list(self._signals_executed),
-            "binance_spread_bps": list(self._binance_spread_bps),
-            "kraken_spread_bps": list(self._kraken_spread_bps),
-            "binance_mid": list(self._binance_mid),
-            "kraken_mid": list(self._kraken_mid),
-            "circuit_state": list(self._circuit_state),
-        }
-
-# =============================================================================
-# ALERT MANAGER
-# =============================================================================
-
-class AlertManager:
-    def __init__(self, webhook_url=None):
-        self.webhook_url = webhook_url
-        self._last_alert_time = {}
-        self._rate_limit_seconds = 5.0
-        self._lock = asyncio.Lock()
-
-    async def send(self, level, title, message, fields=None):
-        if not self.webhook_url: return
-        async with self._lock:
             now = time.time()
-            if now - self._last_alert_time.get(level, 0) < self._rate_limit_seconds: return
-            self._last_alert_time[level] = now
-            payload = {"level": level.value, "title": title, "message": message,
-                       "timestamp": datetime.now(timezone.utc).isoformat(), "fields": fields or {}}
-            try: asyncio.create_task(self._post_webhook(payload))
-            except Exception as e: LOG.warning("[ALERT] Queue failed: %s" % e)
+            self._ts.append(now)
+            lat = engine.latency.metrics()
+            self._det_lat_p50.append(lat["detection_us"]["p50"])
+            self._det_lat_p99.append(lat["detection_us"]["p99"])
+            self._exec_lat_p50.append(lat["execution_us"]["p50"])
+            self._exec_lat_p99.append(lat["execution_us"]["p99"])
+            self._sig_det.append(engine.signals_detected)
+            self._sig_exec.append(engine.signals_executed)
+            self._pnl.append(float(engine.ledger.metrics()["total_realized_pnl"]))
 
-    async def _post_webhook(self, payload):
-        try:
-            data = json.dumps(payload).encode('utf-8')
-            req = urllib.request.Request(self.webhook_url, data=data,
-                                         headers={'Content-Type': 'application/json'}, method='POST')
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, urllib.request.urlopen, req, 5)
-        except Exception as e: LOG.warning("[ALERT] Delivery failed: %s" % e)
-
-    async def alert_execution(self, signal, result):
-        await self.send(AlertLevel.EXECUTION, "Arbitrage: %s" % result.execution_id,
-                        "Net: %s" % signal.net_profit,
-                        {"Buy": signal.buy_exchange.value, "Sell": signal.sell_exchange.value,
-                         "Latency": "%d us" % result.latency_us, "Status": result.status})
-
-    async def alert_circuit_opened(self, reason):
-        await self.send(AlertLevel.CRITICAL, "CIRCUIT BREAKER OPENED", reason)
-
-    async def alert_error(self, error):
-        await self.send(AlertLevel.WARNING, "Engine Error", error)
-
-# =============================================================================
-# HEALTH HTTP SERVER with REAL-TIME CHART DASHBOARD + SLICERS
-# =============================================================================
-
-
-# =============================================================================
-# HEALTH HTTP SERVER with REAL-TIME CHART DASHBOARD + SLICERS (v5.2 FIXED)
-# =============================================================================
-
-class HealthServer:
-    def __init__(self, port=8080):
-        self.port = port
-        self._engine_ref = None
-        self._server = None
-        self._task = None
-
-    def attach_engine(self, engine):
-        self._engine_ref = engine
-
-    async def start(self):
-        self._server = await asyncio.start_server(self._handle_request, '0.0.0.0', self.port)
-        LOG.info("[HEALTH] Dashboard: http://0.0.0.0:%d/status" % self.port)
-        self._task = asyncio.create_task(self._server.serve_forever())
-
-    async def _handle_request(self, reader, writer):
-        try:
-            request_line = (await reader.readline()).decode('utf-8').strip()
-            if not request_line:
-                writer.close()
-                await writer.wait_closed()
-                return
-            parts = request_line.split()
-            path = parts[1] if len(parts) > 1 else "/"
-
-            if path == "/health":
-                body = json.dumps({"status": "ok", "timestamp": time.time_ns()})
-                status = "200 OK"
-                ct = "application/json"
-            elif path == "/metrics":
-                body = json.dumps(self._get_metrics(), indent=2, default=str)
-                status = "200 OK"
-                ct = "application/json"
-            elif path == "/status":
-                body = self._get_dashboard_html()
-                status = "200 OK"
-                ct = "text/html"
-            elif path == "/api/trades":
-                body = json.dumps(self._get_trade_data(), indent=2, default=str)
-                status = "200 OK"
-                ct = "application/json"
+            exs = list(engine.exs.values())
+            if len(exs) >= 2:
+                ob_a = exs[0].get_ob()
+                ob_b = exs[1].get_ob()
+                if ob_a and ob_b:
+                    self._spread_a.append(float(ob_a.spread_bps()))
+                    self._spread_b.append(float(ob_b.spread_bps()))
+                    ma = ob_a.mid()
+                    mb = ob_b.mid()
+                    self._price_a.append(float(ma) if ma else 0)
+                    self._price_b.append(float(mb) if mb else 0)
+                else:
+                    self._spread_a.append(0)
+                    self._spread_b.append(0)
+                    self._price_a.append(0)
+                    self._price_b.append(0)
             else:
-                body = "Not Found"
-                status = "404 Not Found"
-                ct = "text/plain"
+                self._spread_a.append(0)
+                self._spread_b.append(0)
+                self._price_a.append(0)
+                self._price_b.append(0)
+            self._circuit.append(1 if engine.cb.state() == "CLOSED" else 0)
 
-            response = (
-                "HTTP/1.1 %s\r\n"
-                "Content-Type: %s\r\n"
-                "Content-Length: %d\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "%s"
-            ) % (status, ct, len(body.encode('utf-8')), body)
-            writer.write(response.encode('utf-8'))
-            await writer.drain()
-        except Exception as e:
-            LOG.warning("[HEALTH] Error: %s" % e)
-        finally:
-            writer.close()
-            await writer.wait_closed()
-
-    def _get_metrics(self):
-        if self._engine_ref is None:
-            return {"error": "No engine"}
+    def chart_data(self):
         return {
-            "engine": {
-                "signals_detected": self._engine_ref._signals_detected,
-                "signals_executed": self._engine_ref._signals_executed,
-                "success_rate": round(
-                    self._engine_ref._signals_executed
-                    / max(self._engine_ref._signals_detected, 1) * 100, 2
-                ),
-                "uptime_sec": (time.time_ns() - self._engine_ref._start_time_ns) / 1e9,
-            },
-            "circuit": self._engine_ref.circuit_breaker.get_metrics(),
-            "latency": self._engine_ref.latency_tracker.get_metrics(),
-            "pnl": self._engine_ref.ledger.get_metrics(),
-            "exchanges": {
-                ex_id.value: {"connected": m.is_connected, "msgs": m.messages_received}
-                for ex_id, m in self._engine_ref.exchanges.items()
-            },
-            "charts": self._engine_ref.metrics_history.get_chart_data()
+            "timestamps": list(self._ts),
+            "pnl": list(self._pnl),
+            "det_p50": list(self._det_lat_p50),
+            "det_p99": list(self._det_lat_p99),
+            "exec_p50": list(self._exec_lat_p50),
+            "exec_p99": list(self._exec_lat_p99),
+            "sig_det": list(self._sig_det),
+            "sig_exec": list(self._sig_exec),
+            "spread_a": list(self._spread_a),
+            "spread_b": list(self._spread_b),
+            "price_a": list(self._price_a),
+            "price_b": list(self._price_b),
+            "circuit": list(self._circuit)
         }
 
-    def _get_trade_data(self):
-        if self._engine_ref is None:
-            return {"trades": []}
-        pnl = self._engine_ref.ledger.get_metrics()
-        return {"trades": pnl.get("trade_history", [])}
+# ------------------------------------------------------------------------------
+# ALERT MANAGER
+# ------------------------------------------------------------------------------
+class AlertMan:
+    def __init__(self, webhook: Optional[str] = None):
+        self.webhook = webhook
+        self._history = deque(maxlen=100)
 
-    def _get_dashboard_html(self):
-        return r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ARB v5.2 — Spatial Arbitrage Command Center</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-<style>
-:root {
-  --bg: #0b0f1a; --bg-card: rgba(18,25,45,0.9); --border: rgba(56,189,248,0.12);
-  --text: #e2e8f0; --text-dim: #94a3b8; --accent: #38bdf8; --accent2: #a78bfa;
-  --profit: #34d399; --loss: #f87171; --warn: #fbbf24; --glass: rgba(255,255,255,0.03);
-}
-* { margin:0; padding:0; box-sizing:border-box; }
-body {
-  background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif;
-  min-height: 100vh;
-  background-image:
-    radial-gradient(circle at 15% 25%, rgba(56,189,248,0.06) 0%, transparent 45%),
-    radial-gradient(circle at 85% 75%, rgba(167,139,250,0.06) 0%, transparent 45%);
-}
-.header {
-  padding: 18px 28px; border-bottom: 1px solid var(--border);
-  display: flex; justify-content: space-between; align-items: center;
-  background: var(--glass); backdrop-filter: blur(12px);
-}
-.header h1 { font-size: 1.35rem; font-weight: 700; letter-spacing: -0.3px; }
-.header h1 span { color: var(--accent); }
-.badge {
-  padding: 5px 12px; border-radius: 20px; font-size: 0.72rem; font-weight: 600;
-  text-transform: uppercase; letter-spacing: 0.5px;
-}
-.badge.closed { background: rgba(52,211,153,0.12); color: var(--profit); border: 1px solid rgba(52,211,153,0.25); }
-.badge.open { background: rgba(248,113,113,0.12); color: var(--loss); border: 1px solid rgba(248,113,113,0.25); }
+    async def alert_exec(self, sig: ArbSig, res: ExecRes):
+        msg = "EXEC %s | %s->%s | PnL:%s | %dus" % (res.eid, sig.buy_ex, sig.sell_ex, res.status, res.latency_us)
+        self._history.append({"ts": time.time(), "level": "execution", "msg": msg})
+        LOG.info("[ALERT] %s", msg)
 
-.slicer-panel {
-  margin: 18px 28px; padding: 16px 22px;
-  background: var(--bg-card); border: 1px solid var(--border); border-radius: 14px;
-  backdrop-filter: blur(12px); display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end;
-}
-.slicer-group { display: flex; flex-direction: column; gap: 5px; }
-.slicer-group label { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); font-weight: 600; }
-.slicer-group select, .slicer-group input {
-  background: var(--glass); border: 1px solid var(--border); color: var(--text);
-  padding: 7px 12px; border-radius: 8px; font-size: 0.82rem; outline: none;
-  min-width: 130px; cursor: pointer; transition: all 0.2s;
-}
-.slicer-group select:hover, .slicer-group input:hover { border-color: var(--accent); }
-.slicer-group select:focus, .slicer-group input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(56,189,248,0.08); }
-.slicer-btn {
-  background: linear-gradient(135deg, var(--accent), var(--accent2));
-  border: none; color: #fff; padding: 9px 20px; border-radius: 8px;
-  font-weight: 600; font-size: 0.82rem; cursor: pointer; transition: all 0.2s;
-}
-.slicer-btn:hover { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(56,189,248,0.2); }
-.slicer-btn:active { transform: translateY(0); }
+    async def alert_err(self, err: str):
+        self._history.append({"ts": time.time(), "level": "critical", "msg": err})
+        LOG.error("[ALERT] %s", err)
 
-.kpi-grid {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-  gap: 14px; margin: 0 28px 18px;
-}
-.kpi-card {
-  background: var(--bg-card); border: 1px solid var(--border); border-radius: 14px;
-  padding: 18px; backdrop-filter: blur(12px); transition: all 0.25s;
-}
-.kpi-card:hover { border-color: rgba(56,189,248,0.25); transform: translateY(-1px); }
-.kpi-card .kpi-label { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 6px; }
-.kpi-card .kpi-value { font-size: 1.5rem; font-weight: 700; }
-.kpi-card .kpi-sub { font-size: 0.78rem; color: var(--text-dim); margin-top: 3px; }
-.kpi-profit { color: var(--profit); }
-.kpi-loss { color: var(--loss); }
-
-.chart-grid {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
-  gap: 14px; margin: 0 28px 18px;
-}
-.chart-card {
-  background: var(--bg-card); border: 1px solid var(--border); border-radius: 14px;
-  padding: 18px; backdrop-filter: blur(12px);
-}
-.chart-card h3 { font-size: 0.82rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 12px; }
-.chart-wrapper { position: relative; height: 240px; }
-
-.trade-panel {
-  margin: 0 28px 28px;
-  background: var(--bg-card); border: 1px solid var(--border); border-radius: 14px;
-  padding: 18px; backdrop-filter: blur(12px);
-}
-.trade-panel h3 { font-size: 0.82rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 12px; }
-.trade-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
-.trade-table th { text-align: left; padding: 9px 10px; color: var(--text-dim); font-weight: 600; text-transform: uppercase; font-size: 0.68rem; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); }
-.trade-table td { padding: 9px 10px; border-bottom: 1px solid rgba(255,255,255,0.025); }
-.trade-table tr:hover { background: var(--glass); }
-.status-filled { color: var(--profit); font-weight: 600; }
-.status-failed { color: var(--loss); font-weight: 600; }
-.status-partial { color: var(--warn); font-weight: 600; }
-
-.footer {
-  text-align: center; padding: 18px; color: var(--text-dim); font-size: 0.72rem;
-  border-top: 1px solid var(--border);
-}
-
-@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
-.live-dot { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--profit); margin-right:7px; animation:pulse 2.5s infinite; }
-.no-data { text-align:center; color:var(--text-dim); padding:30px; font-size:0.85rem; }
-</style>
-</head>
-<body>
-
-<div class="header">
-  <div>
-    <h1><span>ARB</span> v5.2 &mdash; Spatial Arbitrage Command Center</h1>
-    <div style="margin-top:5px;font-size:0.78rem;color:var(--text-dim);">
-      <span class="live-dot"></span>Live | Uptime: <span id="uptime">0s</span> | Refresh: <span id="refreshLabel">2s</span>
-    </div>
-  </div>
-  <div class="badge closed" id="circuitBadge">CIRCUIT: CLOSED</div>
-</div>
-
-<!-- SLICERS -->
-<div class="slicer-panel">
-  <div class="slicer-group">
-    <label>Time Range</label>
-    <select id="timeSlicer">
-      <option value="all">All Time</option>
-      <option value="60">Last 1 Minute</option>
-      <option value="300">Last 5 Minutes</option>
-      <option value="900" selected>Last 15 Minutes</option>
-      <option value="3600">Last 1 Hour</option>
-    </select>
-  </div>
-  <div class="slicer-group">
-    <label>Min Profit ($)</label>
-    <input type="number" id="profitSlicer" value="0" min="0" step="0.01" placeholder="0.00">
-  </div>
-  <div class="slicer-group">
-    <label>Exchange Pair</label>
-    <select id="pairSlicer">
-      <option value="all">All Pairs</option>
-      <option value="binance_kraken">Binance &rarr; Kraken</option>
-      <option value="kraken_binance">Kraken &rarr; Binance</option>
-    </select>
-  </div>
-  <div class="slicer-group">
-    <label>Status Filter</label>
-    <select id="statusSlicer">
-      <option value="all">All Statuses</option>
-      <option value="FILLED">FILLED</option>
-      <option value="FAILED">FAILED</option>
-      <option value="PARTIAL">PARTIAL</option>
-    </select>
-  </div>
-  <div class="slicer-group">
-    <label>Refresh Rate</label>
-    <select id="refreshSlicer">
-      <option value="1000">1 second</option>
-      <option value="2000" selected>2 seconds</option>
-      <option value="5000">5 seconds</option>
-      <option value="10000">10 seconds</option>
-    </select>
-  </div>
-  <button class="slicer-btn" id="applyBtn">Apply Filters</button>
-</div>
-
-<!-- KPI CARDS -->
-<div class="kpi-grid">
-  <div class="kpi-card">
-    <div class="kpi-label">Realized P&amp;L</div>
-    <div class="kpi-value" id="kpiPnl">$0.00</div>
-    <div class="kpi-sub" id="kpiPnlSub">Total profit</div>
-  </div>
-  <div class="kpi-card">
-    <div class="kpi-label">Success Rate</div>
-    <div class="kpi-value" id="kpiRate">0.0%</div>
-    <div class="kpi-sub" id="kpiRateSub">0 / 0</div>
-  </div>
-  <div class="kpi-card">
-    <div class="kpi-label">Avg Exec Latency</div>
-    <div class="kpi-value" id="kpiLat">0 &mu;s</div>
-    <div class="kpi-sub" id="kpiLatSub">p50 execution</div>
-  </div>
-  <div class="kpi-card">
-    <div class="kpi-label">Signals / Min</div>
-    <div class="kpi-value" id="kpiSig">0</div>
-    <div class="kpi-sub" id="kpiSigSub">Detection rate</div>
-  </div>
-  <div class="kpi-card">
-    <div class="kpi-label">Total Trades</div>
-    <div class="kpi-value" id="kpiTrades">0</div>
-    <div class="kpi-sub" id="kpiTradesSub">Completed</div>
-  </div>
-  <div class="kpi-card">
-    <div class="kpi-label">Binance Spread</div>
-    <div class="kpi-value" id="kpiSpread">0 bps</div>
-    <div class="kpi-sub" id="kpiSpreadSub">Top-of-book</div>
-  </div>
-</div>
-
-<!-- CHARTS -->
-<div class="chart-grid">
-  <div class="chart-card">
-    <h3>P&amp;L Over Time</h3>
-    <div class="chart-wrapper"><canvas id="pnlChart"></canvas></div>
-  </div>
-  <div class="chart-card">
-    <h3>Execution Latency (&mu;s)</h3>
-    <div class="chart-wrapper"><canvas id="latChart"></canvas></div>
-  </div>
-  <div class="chart-card">
-    <h3>Signal Rate</h3>
-    <div class="chart-wrapper"><canvas id="sigChart"></canvas></div>
-  </div>
-  <div class="chart-card">
-    <h3>Exchange Spreads (bps)</h3>
-    <div class="chart-wrapper"><canvas id="spreadChart"></canvas></div>
-  </div>
-  <div class="chart-card">
-    <h3>Price Divergence</h3>
-    <div class="chart-wrapper"><canvas id="priceChart"></canvas></div>
-  </div>
-  <div class="chart-card">
-    <h3>Circuit Breaker State</h3>
-    <div class="chart-wrapper"><canvas id="circuitChart"></canvas></div>
-  </div>
-</div>
-
-<!-- TRADE LOG -->
-<div class="trade-panel">
-  <h3>Trade Log <span style="float:right;font-weight:400;color:var(--text-dim);font-size:0.72rem;" id="tradeCount">0 trades</span></h3>
-  <div style="overflow-x:auto;">
-    <table class="trade-table">
-      <thead>
-        <tr>
-          <th>Time</th><th>ID</th><th>Buy</th><th>Sell</th>
-          <th>Buy VWAP</th><th>Sell VWAP</th><th>Volume</th>
-          <th>Net Profit</th><th>Latency</th><th>Status</th>
-        </tr>
-      </thead>
-      <tbody id="tradeBody">
-        <tr><td colspan="10" class="no-data">Waiting for trades...</td></tr>
-      </tbody>
-    </table>
-  </div>
-</div>
-
-<div class="footer">Spatial Arbitrage Engine v5.2 | Zero-Gap Architecture | Built for Profit</div>
-
-<script>
-// ===================== CHART CONFIG =====================
-Chart.defaults.color = '#64748b';
-Chart.defaults.borderColor = 'rgba(255,255,255,0.04)';
-Chart.defaults.font.family = "'Segoe UI', system-ui, sans-serif";
-Chart.defaults.font.size = 11;
-
-function makeChart(ctx, label, color, fill) {
-  return new Chart(ctx, {
-    type: 'line',
-    data: { labels: [], datasets: [{ label, data: [], borderColor: color, backgroundColor: color + '18', borderWidth: 2, pointRadius: 0, pointHoverRadius: 4, tension: 0.35, fill: fill }] },
-    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, interaction: { intersect: false, mode: 'index' }, scales: { x: { grid: { display: false }, ticks: { maxTicksLimit: 8 } }, y: { grid: { color: 'rgba(255,255,255,0.03)' } } }, animation: { duration: 400 } }
-  });
-}
-
-const pnlChart = makeChart(document.getElementById('pnlChart'), 'P&L', '#34d399', true);
-const latChart = makeChart(document.getElementById('latChart'), 'p50', '#a78bfa', false);
-latChart.data.datasets.push({ label: 'p99', data: [], borderColor: '#f87171', backgroundColor: '#f8717118', borderWidth: 1.5, pointRadius: 0, tension: 0.35, fill: false });
-const sigChart = makeChart(document.getElementById('sigChart'), 'Detected', '#38bdf8', true);
-sigChart.data.datasets.push({ label: 'Executed', data: [], borderColor: '#34d399', backgroundColor: '#34d39918', borderWidth: 2, pointRadius: 0, tension: 0.35, fill: true });
-const spreadChart = makeChart(document.getElementById('spreadChart'), 'Binance', '#38bdf8', false);
-spreadChart.data.datasets.push({ label: 'Kraken', data: [], borderColor: '#a78bfa', backgroundColor: '#a78bfa18', borderWidth: 2, pointRadius: 0, tension: 0.35, fill: false });
-const priceChart = makeChart(document.getElementById('priceChart'), 'Binance', '#38bdf8', false);
-priceChart.data.datasets.push({ label: 'Kraken', data: [], borderColor: '#a78bfa', backgroundColor: '#a78bfa18', borderWidth: 2, pointRadius: 0, tension: 0.35, fill: false });
-const circuitChart = new Chart(document.getElementById('circuitChart'), {
-  type: 'line',
-  data: { labels: [], datasets: [{ label: 'Circuit', data: [], borderColor: '#fbbf24', backgroundColor: '#fbbf2418', borderWidth: 2, pointRadius: 0, tension: 0, fill: true, stepped: true }] },
-  options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { grid: { display: false }, ticks: { maxTicksLimit: 8 } }, y: { min: -0.1, max: 1.3, grid: { color: 'rgba(255,255,255,0.03)' }, ticks: { callback: v => v >= 0.5 ? 'CLOSED' : 'OPEN', stepSize: 1 } } }, animation: { duration: 300 } }
-});
-
-const charts = [pnlChart, latChart, sigChart, spreadChart, priceChart, circuitChart];
-
-// ===================== STATE =====================
-let allData = { timestamps: [], realized_pnl: [], exec_latency_p50: [], exec_latency_p99: [], detection_latency_avg: [], signals_detected: [], signals_executed: [], binance_spread_bps: [], kraken_spread_bps: [], binance_mid: [], kraken_mid: [], circuit_state: [] };
-let allTrades = [];
-let refreshInterval = 2000;
-let timer = null;
-
-// ===================== RENDER =====================
-function render() {
-  const timeVal = document.getElementById('timeSlicer').value;
-  const minProfit = parseFloat(document.getElementById('profitSlicer').value) || 0;
-  const pairVal = document.getElementById('pairSlicer').value;
-  const statusVal = document.getElementById('statusSlicer').value;
-
-  // Slice chart data by time
-  let s = 0;
-  if (timeVal !== 'all' && allData.timestamps.length > 0) {
-    const secs = parseInt(timeVal);
-    const points = Math.ceil(secs / 2);
-    s = Math.max(0, allData.timestamps.length - points);
-  }
-  const e = allData.timestamps.length;
-
-  // Update charts
-  updateChart(pnlChart, allData.timestamps.slice(s, e), [allData.realized_pnl.slice(s, e)]);
-  updateChart(latChart, allData.timestamps.slice(s, e), [allData.exec_latency_p50.slice(s, e), allData.exec_latency_p99.slice(s, e)]);
-  updateChart(sigChart, allData.timestamps.slice(s, e), [allData.signals_detected.slice(s, e), allData.signals_executed.slice(s, e)]);
-  updateChart(spreadChart, allData.timestamps.slice(s, e), [allData.binance_spread_bps.slice(s, e), allData.kraken_spread_bps.slice(s, e)]);
-  updateChart(priceChart, allData.timestamps.slice(s, e), [allData.binance_mid.slice(s, e), allData.kraken_mid.slice(s, e)]);
-  updateChart(circuitChart, allData.timestamps.slice(s, e), [allData.circuit_state.slice(s, e)]);
-
-  // Filter & render trades
-  let filtered = allTrades.filter(t => {
-    const profit = parseFloat(t.net_profit || 0);
-    if (profit < minProfit) return false;
-    if (pairVal !== 'all') {
-      const pair = (t.buy_exchange || '') + '_' + (t.sell_exchange || '');
-      if (pair !== pairVal) return false;
-    }
-    if (statusVal !== 'all') {
-      const st = (t.status || '').toUpperCase();
-      if (st === 'PARTIAL_BUY_ONLY' || st === 'PARTIAL_SELL_ONLY') {
-        if (statusVal !== 'PARTIAL') return false;
-      } else if (st !== statusVal) {
-        return false;
-      }
-    }
-    return true;
-  });
-  renderTrades(filtered);
-}
-
-function updateChart(chart, labels, datasets) {
-  if (!labels.length) return;
-  chart.data.labels = labels;
-  datasets.forEach((d, i) => { if (chart.data.datasets[i]) chart.data.datasets[i].data = d; });
-  chart.update('none');
-}
-
-function renderTrades(trades) {
-  const tbody = document.getElementById('tradeBody');
-  document.getElementById('tradeCount').textContent = trades.length + ' trades';
-  if (!trades.length) {
-    tbody.innerHTML = '<tr><td colspan="10" class="no-data">No trades match current filters</td></tr>';
-    return;
-  }
-  tbody.innerHTML = trades.slice(0, 50).map(t => {
-    const profit = parseFloat(t.net_profit || 0);
-    const profitClass = profit >= 0 ? 'kpi-profit' : 'kpi-loss';
-    let statusClass = 'status-partial';
-    const st = (t.status || '').toUpperCase();
-    if (st === 'FILLED') statusClass = 'status-filled';
-    else if (st === 'FAILED') statusClass = 'status-failed';
-    const ts = t.timestamp ? t.timestamp.split('T')[1].split('.')[0] : '-';
-    return '<tr>' +
-      '<td>' + ts + '</td>' +
-      '<td>' + (t.execution_id ? t.execution_id.slice(-8) : '-') + '</td>' +
-      '<td>' + (t.buy_exchange || '-') + '</td>' +
-      '<td>' + (t.sell_exchange || '-') + '</td>' +
-      '<td>$' + (t.buy_vwap || '0') + '</td>' +
-      '<td>$' + (t.sell_vwap || '0') + '</td>' +
-      '<td>' + (t.target_volume || '0') + ' BTC</td>' +
-      '<td class="' + profitClass + '">$' + profit.toFixed(2) + '</td>' +
-      '<td>' + (t.latency_us || 0) + ' &mu;s</td>' +
-      '<td class="' + statusClass + '">' + (t.status || '-') + '</td>' +
-      '</tr>';
-  }).join('');
-}
-
-// ===================== FETCH =====================
-async function fetchData() {
-  try {
-    const [mRes, tRes] = await Promise.all([fetch('/metrics'), fetch('/api/trades')]);
-    if (!mRes.ok || !tRes.ok) throw new Error('HTTP error');
-    const m = await mRes.json();
-    const t = await tRes.json();
-
-    // Update KPIs
-    const pnl = parseFloat(m.pnl?.total_realized_pnl || 0);
-    const pnlEl = document.getElementById('kpiPnl');
-    pnlEl.textContent = (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2);
-    pnlEl.className = 'kpi-value ' + (pnl >= 0 ? 'kpi-profit' : 'kpi-loss');
-
-    const rate = m.engine?.success_rate || 0;
-    document.getElementById('kpiRate').textContent = rate.toFixed(1) + '%';
-    document.getElementById('kpiRateSub').textContent = (m.engine?.signals_executed || 0) + ' / ' + (m.engine?.signals_detected || 0);
-
-    const lat = m.latency?.execution_us?.p50 || 0;
-    document.getElementById('kpiLat').textContent = Math.round(lat) + ' μs';
-
-    const sigMin = m.engine?.signals_detected ? Math.round(m.engine.signals_detected / Math.max(m.engine.uptime_sec / 60, 1)) : 0;
-    document.getElementById('kpiSig').textContent = sigMin;
-
-    document.getElementById('kpiTrades').textContent = m.pnl?.trade_count || 0;
-
-    const bSpread = m.charts?.binance_spread_bps?.length ? m.charts.binance_spread_bps[m.charts.binance_spread_bps.length - 1] : 0;
-    document.getElementById('kpiSpread').textContent = bSpread.toFixed(2) + ' bps';
-
-    // Circuit badge
-    const circ = m.circuit?.state || 'CLOSED';
-    const badge = document.getElementById('circuitBadge');
-    badge.textContent = 'CIRCUIT: ' + circ;
-    badge.className = 'badge ' + (circ === 'CLOSED' ? 'closed' : 'open');
-
-    // Uptime
-    const up = Math.floor(m.engine?.uptime_sec || 0);
-    document.getElementById('uptime').textContent = Math.floor(up / 60) + 'm ' + (up % 60) + 's';
-
-    // Store data
-    allData = m.charts || allData;
-    allTrades = t.trades || [];
-
-    render();
-  } catch (e) {
-    console.error('Fetch error:', e);
-  }
-}
-
-// ===================== EVENTS =====================
-document.getElementById('applyBtn').addEventListener('click', render);
-document.getElementById('refreshSlicer').addEventListener('change', function() {
-  refreshInterval = parseInt(this.value);
-  document.getElementById('refreshLabel').textContent = (refreshInterval / 1000) + 's';
-  clearInterval(timer);
-  timer = setInterval(fetchData, refreshInterval);
-});
-
-// ===================== INIT =====================
-timer = setInterval(fetchData, refreshInterval);
-fetchData();
-</script>
-</body>
-</html>"""
-
-    async def shutdown(self):
-        if self._server:
-            self._server.close()
-            await self._server.wait_closed()
-        LOG.info("[HEALTH] Shutdown.")
-
-# =============================================================================
-# EXCHANGE WEBSOCKET MANAGER (LIVE)
-# =============================================================================
-
-class ExchangeWebSocketManager:
-    def __init__(self, config, symbol, reconnect_base_delay_ms=100, reconnect_max_delay_ms=30000):
-        self.config = config
+# ------------------------------------------------------------------------------
+# EXCHANGE MANAGER
+# ------------------------------------------------------------------------------
+class ExManager:
+    def __init__(self, cfg: ExCfg, symbol: str):
+        self.cfg = cfg
         self.symbol = symbol
-        self.exchange_id = config.exchange_id
-        self._reconnect_base_delay_ms = reconnect_base_delay_ms
-        self._reconnect_max_delay_ms = reconnect_max_delay_ms
-        self._consecutive_failures = 0
-        self._exchange = None
-        self._is_connected = False
-        self._shutdown_event = asyncio.Event()
-        self._order_book = None
-        self._lock = asyncio.Lock()
-        self._messages_received = 0
-        self._last_message_ns = 0
-
-    async def _create_exchange(self):
-        if ccxtpro is None:
-            raise RuntimeError("ccxt not installed")
-        exchange_class = getattr(ccxtpro, self.exchange_id.value, None)
-        if exchange_class is None:
-            raise RuntimeError("Exchange %s not supported" % self.exchange_id.value)
-        instance = exchange_class({
-            'apiKey': self.config.api_key,
-            'secret': self.config.api_secret,
-            'enableRateLimit': True,
-            'options': {'defaultType': 'spot'}
-        })
-        if self.config.sandbox:
-            try:
-                instance.set_sandbox_mode(True)
-            except Exception as e:
-                LOG.warning("[%s] Sandbox unavailable: %s" % (self.exchange_id.value, e))
-        return instance
+        self.name = cfg.name
+        self.ex = None
+        self._ob: Optional[OB] = None
+        self._balances: Dict[str, Decimal] = {}
+        self._connected = False
+        self._last_up = 0
+        self._msgs = 0
+        self._shutdown = False
+        self._demo_base = {"binance": 65000.0, "okx": 65200.0, "bybit": 65100.0, "bitget": 64900.0}.get(cfg.name, 65000.0)
 
     async def connect(self):
-        while not self._shutdown_event.is_set():
-            try:
-                LOG.info("[%s] Connecting..." % self.exchange_id.value)
-                self._exchange = await self._create_exchange()
-                await self._exchange.load_markets()
-                self._is_connected = True
-                self._consecutive_failures = 0
-                LOG.info("[%s] Connected." % self.exchange_id.value)
-                await self._consume_order_book()
-            except Exception as e:
-                self._consecutive_failures += 1
-                self._is_connected = False
-                delay_ms = min(
-                    self._reconnect_base_delay_ms * (2 ** (self._consecutive_failures - 1)),
-                    self._reconnect_max_delay_ms
-                )
-                LOG.error("[%s] Fail #%d: %s. Reconnect %dms..." % (
-                    self.exchange_id.value, self._consecutive_failures, e, delay_ms))
-                if self._exchange:
-                    try:
-                        await self._exchange.close()
-                    except:
-                        pass
-                self._exchange = None
-                try:
-                    await asyncio.wait_for(
-                        self._shutdown_event.wait(),
-                        timeout=delay_ms / 1000.0
-                    )
-                except asyncio.TimeoutError:
-                    pass
-
-    async def _consume_order_book(self):
-        if self._exchange is None:
+        if self.cfg.demo:
+            self._connected = True
+            asyncio.create_task(self._demo_loop())
+            LOG.info("[%s] DEMO active", self.name.upper())
             return
+        if not CCXT_OK:
+            raise RuntimeError("ccxt not installed. Run: pip install ccxt")
+        cls = getattr(ccxt, self.name, None)
+        if not cls:
+            raise RuntimeError("Exchange %s not supported" % self.name)
+        params = {"apiKey": self.cfg.key, "secret": self.cfg.secret, "enableRateLimit": True, "options": {"defaultType": "spot"}}
+        if self.cfg.passphrase:
+            params["password"] = self.cfg.passphrase
+        self.ex = cls(params)
+        await self.ex.load_markets()
+        if self.symbol not in self.ex.markets:
+            raise ValueError("Symbol %s not on %s" % (self.symbol, self.name))
         try:
-            while not self._shutdown_event.is_set():
-                try:
-                    ob = await self._exchange.watch_order_book(self.symbol)
-                    now_ns = time.time_ns()
-                    self._last_message_ns = now_ns
-                    self._messages_received += 1
-                    async with self._lock:
-                        self._order_book = self._normalize_order_book(ob, now_ns)
-                except Exception as e:
-                    LOG.error("[%s] Stream: %s" % (self.exchange_id.value, e))
-                    raise
-        except asyncio.CancelledError:
-            LOG.info("[%s] Cancelled." % self.exchange_id.value)
-            raise
+            fees = await self.ex.fetch_trading_fee(self.symbol)
+            self.cfg = ExCfg(self.name, self.cfg.key, self.cfg.secret, self.cfg.passphrase, Decimal(str(fees.get("taker", 0.001))), False)
         except Exception as e:
-            LOG.error("[%s] Fatal: %s" % (self.exchange_id.value, e))
-            raise
+            LOG.warning("[%s] fee fetch: %s", self.name, e)
+        self._connected = True
+        asyncio.create_task(self._ws_loop())
+        asyncio.create_task(self._bal_loop())
+        LOG.info("[%s] Connected", self.name.upper())
 
-    def _normalize_order_book(self, raw_ob, timestamp_ns):
-        bids = [OrderBookLevel(level[0], level[1]) for level in raw_ob.get('bids', [])]
-        asks = [OrderBookLevel(level[0], level[1]) for level in raw_ob.get('asks', [])]
-        return OrderBookSnapshot(self.exchange_id, self.symbol, timestamp_ns, bids, asks)
+    async def _demo_loop(self):
+        while not self._shutdown:
+            px = self._demo_base + random.uniform(-300, 300)
+            bids = [OBLevel(Decimal(str(px - i * 10)), Decimal(str(random.uniform(0.1, 2.0)))) for i in range(20)]
+            asks = [OBLevel(Decimal(str(px + i * 10)), Decimal(str(random.uniform(0.1, 2.0)))) for i in range(20)]
+            self._ob = OB(bids, asks, time.time_ns())
+            self._last_up = time.time()
+            self._msgs += 1
+            self._balances = {"BTC": Decimal("0.5"), "USDT": Decimal("30000")}
+            await asyncio.sleep(0.5)
 
-    async def get_order_book(self):
-        async with self._lock:
-            return self._order_book
-
-    @property
-    def is_connected(self):
-        return self._is_connected
-
-    @property
-    def messages_received(self):
-        return self._messages_received
-
-    async def shutdown(self):
-        LOG.info("[%s] Shutdown." % self.exchange_id.value)
-        self._shutdown_event.set()
-        self._is_connected = False
-        if self._exchange:
+    async def _ws_loop(self):
+        while self._connected and not self._shutdown:
             try:
-                await self._exchange.close()
+                raw = await self.ex.watch_order_book(self.symbol)
+                self._msgs += 1
+                bids = [OBLevel(Decimal(str(b[0])), Decimal(str(b[1]))) for b in raw.get("bids", [])[:20]]
+                asks = [OBLevel(Decimal(str(a[0])), Decimal(str(a[1]))) for a in raw.get("asks", [])[:20]]
+                self._ob = OB(bids, asks, time.time_ns())
+                self._last_up = time.time()
             except Exception as e:
-                LOG.warning("[%s] Close err: %s" % (self.exchange_id.value, e))
-        self._exchange = None
+                LOG.error("[%s] WS: %s", self.name, e)
+                await asyncio.sleep(1)
 
-
-# =============================================================================
-# SYNTHETIC EXCHANGE MANAGER
-# =============================================================================
-
-class SyntheticExchangeManager:
-    def __init__(self, exchange_id, symbol, base_price, volatility=0.002, arb_inject_prob=0.05):
-        self.exchange_id = exchange_id
-        self.symbol = symbol
-        self.base_price = base_price
-        self.volatility = volatility
-        self.arb_inject_prob = arb_inject_prob
-        self._current_price = base_price
-        self._order_book = None
-        self._lock = asyncio.Lock()
-        self._is_connected = True
-        self._messages_received = 0
-        self._shutdown_event = asyncio.Event()
-        self._task = None
-        self._arb_bias = 0.0
-
-    async def connect(self):
-        LOG.info("[%s] Synthetic generator starting..." % self.exchange_id.value)
-        self._task = asyncio.create_task(self._generate_loop())
-        try:
-            await self._task
-        except asyncio.CancelledError:
-            LOG.info("[%s] Synthetic stopped." % self.exchange_id.value)
-
-    async def _generate_loop(self):
-        while not self._shutdown_event.is_set():
+    async def _bal_loop(self):
+        while self._connected and not self._shutdown:
             try:
-                await asyncio.wait_for(
-                    self._shutdown_event.wait(),
-                    timeout=0.1
-                )
-            except asyncio.TimeoutError:
-                await self._generate_snapshot()
+                bal = await self.ex.fetch_balance()
+                self._balances = {k: Decimal(str(v.get("free", 0))) for k, v in bal.items() if isinstance(v, dict) and Decimal(str(v.get("free", 0))) > 0}
+                await asyncio.sleep(5)
+            except Exception as e:
+                LOG.error("[%s] Bal: %s", self.name, e)
+                await asyncio.sleep(5)
 
-    async def _generate_snapshot(self):
-        now_ns = time.time_ns()
-        drift = (self.base_price - self._current_price) * 0.01
-        noise = random.gauss(0, self.volatility * self._current_price)
-        if random.random() < self.arb_inject_prob:
-            self._arb_bias = random.choice([-0.008, 0.008])
-        else:
-            self._arb_bias *= 0.95
-        self._current_price += drift + noise + (self._arb_bias * self._current_price)
-        self._current_price = max(self._current_price, 1000.0)
-        price = Decimal(str(round(self._current_price, 2)))
-        bids = []
-        asks = []
-        for i in range(20):
-            bp = price * (Decimal("1") - Decimal(str(0.0001 * (i + 1))))
-            ap = price * (Decimal("1") + Decimal(str(0.0001 * (i + 1))))
-            bv = Decimal(str(round(random.uniform(0.5, 5.0), 4)))
-            av = Decimal(str(round(random.uniform(0.5, 5.0), 4)))
-            bids.append(OrderBookLevel(bp.quantize(Decimal("0.01")), bv))
-            asks.append(OrderBookLevel(ap.quantize(Decimal("0.01")), av))
-        bids.sort(key=lambda x: x.price, reverse=True)
-        asks.sort(key=lambda x: x.price)
-        async with self._lock:
-            self._order_book = OrderBookSnapshot(
-                self.exchange_id, self.symbol, now_ns, bids, asks)
-            self._messages_received += 1
+    def get_ob(self) -> Optional[OB]:
+        if not self._ob or (time.time() - self._last_up) > 5:
+            return None
+        return self._ob
 
-    async def get_order_book(self):
-        async with self._lock:
-            return self._order_book
+    def get_bal(self, cur: str) -> Decimal:
+        return self._balances.get(cur, Decimal("0"))
 
-    @property
-    def is_connected(self):
-        return self._is_connected and not self._shutdown_event.is_set()
+    def has_bal(self, side: str, amt: Decimal, px: Decimal) -> bool:
+        base, quote = self.symbol.split("/")
+        if side == "buy":
+            need = amt * px
+            have = self.get_bal(quote)
+            return have >= need
+        return self.get_bal(base) >= amt
 
-    @property
-    def messages_received(self):
-        return self._messages_received
+    async def place_order(self, side: str, amt: Decimal, px: Decimal) -> dict:
+        if self.cfg.demo:
+            await asyncio.sleep(0.05)
+            return {"id": "DEMO-%d" % time.time_ns(), "symbol": self.symbol, "side": side, "type": "limit",
+                    "amount": float(amt), "price": float(px), "average": float(px), "status": "closed",
+                    "filled": float(amt), "remaining": 0.0}
+        if not self.ex:
+            raise ConnectionError("Not connected")
+        return await self.ex.create_order(self.symbol, "limit", side, float(amt), float(px), params={"timeInForce": "IOC"})
 
     async def shutdown(self):
-        LOG.info("[%s] Synthetic shutdown." % self.exchange_id.value)
-        self._shutdown_event.set()
-        self._is_connected = False
-        if self._task and not self._task.done():
+        self._shutdown = True
+        self._connected = False
+        if self.ex:
+            try:
+                await self.ex.close()
+            except Exception:
+                pass
+        LOG.info("[%s] Shutdown", self.name)
+
+# ------------------------------------------------------------------------------
+# EXECUTION ROUTER
+# ------------------------------------------------------------------------------
+class ExecRouter:
+    def __init__(self, sandbox: bool = True):
+        self.sandbox = sandbox
+        self._hist = []
+        self._lock = asyncio.Lock()
+
+    async def execute(self, sig: ArbSig, exs: Dict[str, ExManager]) -> ExecRes:
+        start = time.time_ns()
+        eid = sig.eid
+        LOG.info("[EXEC] %s | BUY %s@%s | SELL %s@%s | Net:%s", eid, sig.buy_ex, sig.buy_vwap, sig.sell_ex, sig.sell_vwap, sig.net_profit)
+
+        buy_m = exs[sig.buy_ex]
+        sell_m = exs[sig.sell_ex]
+
+        if not buy_m.has_bal("buy", sig.target_vol, sig.buy_vwap):
+            return ExecRes(eid, time.time_ns(), sig.buy_ex, sig.sell_ex, None, None, None, None, Decimal("0"), "FAILED", 0, "No buy balance")
+        if not sell_m.has_bal("sell", sig.target_vol, sig.sell_vwap):
+            return ExecRes(eid, time.time_ns(), sig.buy_ex, sig.sell_ex, None, None, None, None, Decimal("0"), "FAILED", 0, "No sell balance")
+
+        if self.sandbox:
+            await asyncio.sleep(0.05)
+            return ExecRes(eid, time.time_ns(), sig.buy_ex, sig.sell_ex, "SIM-" + eid + "-BUY", "SIM-" + eid + "-SELL",
+                           sig.buy_vwap, sig.sell_vwap, sig.target_vol, "FILLED", 50000, None)
+
+        buy_px = sig.buy_vwap * Decimal("1.0002")
+        sell_px = sig.sell_vwap * Decimal("0.9998")
+        bt = buy_m.place_order("buy", sig.target_vol, buy_px)
+        st = sell_m.place_order("sell", sig.target_vol, sell_px)
+        br, sr = await asyncio.gather(bt, st, return_exceptions=True)
+        lat = (time.time_ns() - start) // 1000
+
+        b_ok = not isinstance(br, Exception)
+        s_ok = not isinstance(sr, Exception)
+
+        if b_ok and s_ok:
+            status = "FILLED"
+            err = None
+        elif b_ok and not s_ok:
+            status = "PARTIAL_BUY"
+            err = "Sell failed: %s" % sr
+        elif not b_ok and s_ok:
+            status = "PARTIAL_SELL"
+            err = "Buy failed: %s" % br
+        else:
+            status = "FAILED"
+            err = "Buy:%s | Sell:%s" % (br, sr)
+
+        res = ExecRes(
+            eid=eid, ts_ns=time.time_ns(), buy_ex=sig.buy_ex, sell_ex=sig.sell_ex,
+            buy_oid=br.get("id") if b_ok else None,
+            sell_oid=sr.get("id") if s_ok else None,
+            buy_fill_px=Decimal(str(br.get("average", br.get("price", 0)))) if b_ok else None,
+            sell_fill_px=Decimal(str(sr.get("average", sr.get("price", 0)))) if s_ok else None,
+            filled_vol=sig.target_vol if status == "FILLED" else Decimal("0"),
+            status=status, latency_us=lat, err=err)
+
+        async with self._lock:
+            self._hist.append(res)
+        LOG.info("[EXEC] %s done in %dus | %s", eid, lat, status)
+        return res
+
+# ------------------------------------------------------------------------------
+# DATA SINK
+# ------------------------------------------------------------------------------
+class DataSink:
+    def __init__(self, db="arb_data.db", csv_path="arb_signals.csv", flush=10):
+        self.db = db
+        self.csv = csv_path
+        self.flush = flush
+        self._buf = []
+        self._task = None
+        self._lock = asyncio.Lock()
+
+    def init(self):
+        conn = sqlite3.connect(self.db)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT, eid TEXT, buy_ex TEXT, sell_ex TEXT,
+                symbol TEXT, buy_vwap TEXT, sell_vwap TEXT,
+                target_vol TEXT, net_profit TEXT, status TEXT, err TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS executions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT, eid TEXT, buy_ex TEXT, sell_ex TEXT,
+                buy_oid TEXT, sell_oid TEXT, buy_fill_px TEXT, sell_fill_px TEXT,
+                filled_vol TEXT, status TEXT, latency_us INTEGER, err TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+        if not os.path.exists(self.csv):
+            with open(self.csv, "w", newline="") as f:
+                csv.writer(f).writerow(["ts", "eid", "buy_ex", "sell_ex", "symbol", "buy_vwap", "sell_vwap",
+                                        "target_vol", "net_profit", "exec_status", "latency_us", "err"])
+
+    async def start_bg(self):
+        self._task = asyncio.create_task(self._flusher())
+
+    async def _flusher(self):
+        while True:
+            await asyncio.sleep(self.flush)
+            async with self._lock:
+                if self._buf:
+                    with open(self.csv, "a", newline="") as f:
+                        w = csv.writer(f)
+                        for row in self._buf:
+                            w.writerow(row)
+                    self._buf = []
+
+    def persist_sig(self, sig: ArbSig):
+        conn = sqlite3.connect(self.db)
+        conn.execute("""
+            INSERT INTO signals (ts, eid, buy_ex, sell_ex, symbol, buy_vwap, sell_vwap, target_vol, net_profit, status, err)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (datetime.utcnow().isoformat(), sig.eid, sig.buy_ex, sig.sell_ex, sig.symbol,
+              str(sig.buy_vwap), str(sig.sell_vwap), str(sig.target_vol), str(sig.net_profit), "DETECTED", ""))
+        conn.commit()
+        conn.close()
+
+    async def persist_exec(self, res: ExecRes):
+        conn = sqlite3.connect(self.db)
+        conn.execute("""
+            INSERT INTO executions (ts, eid, buy_ex, sell_ex, buy_oid, sell_oid, buy_fill_px, sell_fill_px, filled_vol, status, latency_us, err)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (datetime.utcnow().isoformat(), res.eid, res.buy_ex, res.sell_ex,
+              res.buy_oid or "", res.sell_oid or "", str(res.buy_fill_px or ""), str(res.sell_fill_px or ""),
+              str(res.filled_vol), res.status, res.latency_us, res.err or ""))
+        conn.commit()
+        conn.close()
+        async with self._lock:
+            self._buf.append([datetime.utcnow().isoformat(), res.eid, res.buy_ex, res.sell_ex,
+                              "", "", "", "", res.filled_vol, res.status, res.latency_us, res.err or ""])
+
+    async def shutdown(self):
+        if self._task:
             self._task.cancel()
             try:
                 await self._task
             except asyncio.CancelledError:
                 pass
 
-
-# =============================================================================
-# CONCURRENT EXECUTION ROUTER
-# =============================================================================
-
-class ExecutionRouter:
-    def __init__(self, sandbox=True):
-        self.sandbox = sandbox
-        self._execution_history = []
-        self._lock = asyncio.Lock()
-
-    async def execute_arbitrage(self, signal, exchanges):
-        start_ns = time.time_ns()
-        eid = signal.execution_id
-        LOG.info("[EXEC] %s | BUY %s@%s | SELL %s@%s | Net:%s" % (
-            eid, signal.buy_exchange.value, signal.buy_vwap,
-            signal.sell_exchange.value, signal.sell_vwap, signal.net_profit))
-
-        buy_task = self._place_order(
-            exchanges[signal.buy_exchange], TradeSide.BUY,
-            signal.symbol, signal.target_volume, eid)
-        sell_task = self._place_order(
-            exchanges[signal.sell_exchange], TradeSide.SELL,
-            signal.symbol, signal.target_volume, eid)
-        buy_res, sell_res = await asyncio.gather(
-            buy_task, sell_task, return_exceptions=True)
-
-        end_ns = time.time_ns()
-        latency_us = (end_ns - start_ns) // 1000
-
-        buy_ok = not isinstance(buy_res, Exception)
-        sell_ok = not isinstance(sell_res, Exception)
-
-        if buy_ok and sell_ok:
-            status = "FILLED"
-            err = None
-        elif buy_ok and not sell_ok:
-            status = "PARTIAL_BUY_ONLY"
-            err = "Sell failed: %s" % sell_res
-        elif not buy_ok and sell_ok:
-            status = "PARTIAL_SELL_ONLY"
-            err = "Buy failed: %s" % buy_res
-        else:
-            status = "FAILED"
-            err = "Buy:%s | Sell:%s" % (buy_res, sell_res)
-
-        result = ExecutionResult(
-            execution_id=eid,
-            timestamp_ns=end_ns,
-            buy_exchange=signal.buy_exchange,
-            sell_exchange=signal.sell_exchange,
-            buy_order_id=buy_res.get('id') if buy_ok else None,
-            sell_order_id=sell_res.get('id') if sell_ok else None,
-            buy_fill_price=Decimal(str(buy_res.get('average', buy_res.get('price', 0)))) if buy_ok else None,
-            sell_fill_price=Decimal(str(sell_res.get('average', sell_res.get('price', 0)))) if sell_ok else None,
-            filled_volume=signal.target_volume if status == "FILLED" else Decimal("0"),
-            status=status,
-            latency_us=latency_us,
-            error_message=err)
-
-        async with self._lock:
-            self._execution_history.append(result)
-        LOG.info("[EXEC] %s done in %dus | %s" % (eid, latency_us, status))
-        return result
-
-    async def _place_order(self, manager, side, symbol, volume, eid):
-        is_synthetic = hasattr(manager, '_generate_snapshot')
-        if is_synthetic:
-            await asyncio.sleep(0.0001)
-            book = await manager.get_order_book()
-            if book is None:
-                raise RuntimeError("No synthetic book")
-            fp = book.best_ask if side == TradeSide.BUY else book.best_bid
-            return {
-                'id': "SIM-%s-%s" % (eid, side.value.upper()),
-                'symbol': symbol,
-                'side': side.value,
-                'type': 'market',
-                'amount': float(volume),
-                'price': float(fp),
-                'average': float(fp),
-                'status': 'closed',
-                'filled': float(volume),
-                'remaining': 0.0,
-                'cost': float(volume * fp),
-                'fee': None,
-                'trades': []
-            }
-
-        exchange = manager._exchange
-        if exchange is None or not manager.is_connected:
-            raise ConnectionError("[%s] Not connected" % manager.exchange_id.value)
-
-        if self.sandbox:
-            await asyncio.sleep(0.0001)
-            book = await manager.get_order_book()
-            fp = book.best_ask if side == TradeSide.BUY else book.best_bid
-            return {
-                'id': "SIM-%s-%s" % (eid, side.value.upper()),
-                'symbol': symbol,
-                'side': side.value,
-                'type': 'market',
-                'amount': float(volume),
-                'price': float(fp),
-                'average': float(fp),
-                'status': 'closed',
-                'filled': float(volume),
-                'remaining': 0.0,
-                'cost': float(volume * fp),
-                'fee': None,
-                'trades': []
-            }
-        else:
-            return await exchange.create_order(
-                symbol=symbol, type='market', side=side.value, amount=float(volume))
-
-
-# =============================================================================
-# MICROSECOND PERSISTENCE LAYER
-# =============================================================================
-
-class DataSink:
-    def __init__(self, db_path="arbitrage_engine.db", csv_path="arbitrage_signals.csv", flush_interval_seconds=60):
-        self.db_path = db_path
-        self.csv_path = csv_path
-        self.flush_interval_seconds = flush_interval_seconds
-        self._conn = None
-        self._cursor = None
-        self._flush_task = None
-        self._shutdown_event = asyncio.Event()
-
-    def initialize(self):
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self._cursor = self._conn.cursor()
-        if self.db_path != ":memory:":
-            self._cursor.execute("PRAGMA journal_mode=WAL;")
-            self._cursor.execute("PRAGMA synchronous=NORMAL;")
-            self._cursor.execute("PRAGMA temp_store=MEMORY;")
-            self._cursor.execute("""
-                CREATE TABLE IF NOT EXISTS arbitrage_signals (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp_ns INTEGER NOT NULL,
-                    received_at TEXT NOT NULL,
-                    symbol TEXT NOT NULL,
-                    buy_exchange TEXT NOT NULL,
-                    sell_exchange TEXT NOT NULL,
-                    buy_vwap TEXT NOT NULL,
-                    sell_vwap TEXT NOT NULL,
-                    target_volume TEXT NOT NULL,
-                    gross_spread TEXT NOT NULL,
-                    buy_fee TEXT NOT NULL,
-                    sell_fee TEXT NOT NULL,
-                    gas_fee TEXT NOT NULL,
-                    net_profit TEXT NOT NULL,
-                    net_profit_pct TEXT NOT NULL,
-                    execution_id TEXT UNIQUE NOT NULL,
-                    executed INTEGER DEFAULT 0,
-                    execution_latency_us INTEGER,
-                    status TEXT)
-            """)
-            self._cursor.execute("CREATE INDEX IF NOT EXISTS idx_ts ON arbitrage_signals(timestamp_ns)")
-            self._cursor.execute("CREATE INDEX IF NOT EXISTS idx_exec ON arbitrage_signals(execution_id)")
-            self._conn.commit()
-            LOG.info("[DATASINK] SQLite at '%s'." % self.db_path)
-
-    def persist_signal(self, signal):
-        if self._cursor is None:
-            raise RuntimeError("Not initialized")
-        self._cursor.execute("""
-            INSERT OR REPLACE INTO arbitrage_signals (
-                timestamp_ns, received_at, symbol, buy_exchange, sell_exchange,
-                buy_vwap, sell_vwap, target_volume, gross_spread, buy_fee,
-                sell_fee, gas_fee, net_profit, net_profit_pct, execution_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            signal.timestamp_ns,
-            datetime.now(timezone.utc).isoformat(),
-            signal.symbol,
-            signal.buy_exchange.value,
-            signal.sell_exchange.value,
-            str(signal.buy_vwap),
-            str(signal.sell_vwap),
-            str(signal.target_volume),
-            str(signal.gross_spread),
-            str(signal.buy_fee),
-            str(signal.sell_fee),
-            str(signal.gas_fee),
-            str(signal.net_profit),
-            str(signal.net_profit_pct),
-            signal.execution_id))
-        self._conn.commit()
-
-    def update_execution_result(self, result):
-        if self._cursor is None:
-            return
-        self._cursor.execute(
-            "UPDATE arbitrage_signals SET executed=1, execution_latency_us=?, status=? WHERE execution_id=?",
-            (result.latency_us, result.status, result.execution_id))
-        self._conn.commit()
-
-    async def start_background_flush(self):
-        self._flush_task = asyncio.create_task(self._background_flush_loop())
-        LOG.info("[DATASINK] Background flush started.")
-
-    async def _background_flush_loop(self):
-        while not self._shutdown_event.is_set():
-            try:
-                await asyncio.wait_for(
-                    self._shutdown_event.wait(),
-                    timeout=self.flush_interval_seconds)
-            except asyncio.TimeoutError:
-                await self._flush_to_csv()
-
-    async def _flush_to_csv(self):
-        if self._cursor is None:
-            return
-        try:
-            self._cursor.execute("SELECT * FROM arbitrage_signals ORDER BY timestamp_ns DESC")
-            rows = self._cursor.fetchall()
-            columns = [desc[0] for desc in self._cursor.description]
-            if not rows:
-                return
-            async with aiofiles.open(self.csv_path, mode='w', newline='') as f:
-                await f.write(','.join(columns) + '\n')
-                for row in rows:
-                    escaped = []
-                    for val in row:
-                        if val is None:
-                            escaped.append('')
-                        elif isinstance(val, str) and (',' in val or '"' in val or '\n' in val):
-                            escaped.append('"' + val.replace('"', '""') + '"')
-                        else:
-                            escaped.append(str(val))
-                    await f.write(','.join(escaped) + '\n')
-            LOG.info("[DATASINK] Flushed %d records to %s" % (len(rows), self.csv_path))
-        except Exception as e:
-            LOG.error("[DATASINK] Flush error: %s" % e)
-
-    async def shutdown(self):
-        LOG.info("[DATASINK] Shutdown. Final flush...")
-        self._shutdown_event.set()
-        if self._flush_task:
-            self._flush_task.cancel()
-            try:
-                await self._flush_task
-            except asyncio.CancelledError:
-                pass
-        await self._flush_to_csv()
-        if self._conn:
-            self._conn.close()
-            LOG.info("[DATASINK] Closed.")
-
-# =============================================================================
-# MAIN ARBITRAGE ENGINE ORCHESTRATOR
-# =============================================================================
-
-class ArbitrageEngine:
-    def __init__(self, arb_config, exchange_configs, data_sink, execution_router,
-                 risk_config=None, poll_interval_ms=10.0, demo_mode=False,
-                 webhook_url=None, health_port=8080):
-        self.config = arb_config
-        self.data_sink = data_sink
-        self.execution_router = execution_router
-        self.poll_interval_ms = poll_interval_ms
-        self.demo_mode = demo_mode
-        self.risk_config = risk_config or RiskConfig()
-
-        self.circuit_breaker = CircuitBreaker(self.risk_config)
-        self.latency_tracker = LatencyTracker(window_size=1000)
-        self.ledger = ProfitLossLedger(arb_config.symbol)
-        self.alert_manager = AlertManager(webhook_url)
-        self.metrics_history = MetricsHistory(max_points=300)
-        self.health_server = HealthServer(port=health_port)
-        self.health_server.attach_engine(self)
-
-        self.exchanges = {}
-        for ec in exchange_configs:
-            if demo_mode:
-                bp = 65000.0 if ec.exchange_id == ExchangeId.BINANCE else 65200.0
-                self.exchanges[ec.exchange_id] = SyntheticExchangeManager(
-                    ec.exchange_id, arb_config.symbol, bp, 0.002, 0.05)
-            else:
-                self.exchanges[ec.exchange_id] = ExchangeWebSocketManager(ec, arb_config.symbol)
-
-        if len(self.exchanges) != 2:
-            raise ValueError("Need exactly 2 exchanges.")
-
-        self._shutdown_event = asyncio.Event()
+# ------------------------------------------------------------------------------
+# MAIN ENGINE
+# ------------------------------------------------------------------------------
+class ArbEngine:
+    def __init__(self, arb_cfg: ArbCfg, ex_cfgs: List[ExCfg], sink: DataSink, router: ExecRouter,
+                 risk_cfg: RiskCfg = None, poll_ms: float = 50.0, demo: bool = False, webhook: str = None, port: int = 8765):
+        self.arb_cfg = arb_cfg
+        self.sink = sink
+        self.router = router
+        self.poll_ms = poll_ms
+        self.demo = demo
+        self.risk_cfg = risk_cfg or RiskCfg()
+        self.cb = CircuitBreaker(self.risk_cfg)
+        self.latency = LatencyTracker()
+        self.ledger = PnLLedger(arb_cfg.symbol)
+        self.alerts = AlertMan(webhook)
+        self.history = MetricsHistory()
+        self.port = port
+        self.exs: Dict[str, ExManager] = {}
+        self._shutdown_ev = asyncio.Event()
         self._tasks = []
-        self._signals_detected = 0
-        self._signals_executed = 0
-        self._start_time_ns = time.time_ns()
+        self.signals_detected = 0
+        self.signals_executed = 0
+        self._start_ns = time.time_ns()
+
+        for ec in ex_cfgs:
+            self.exs[ec.name] = ExManager(ec, arb_cfg.symbol)
+        if len(self.exs) < 2:
+            raise ValueError("Need 2+ exchanges")
 
     async def start(self):
-        LOG.info("=" * 70)
-        LOG.info("ARBITRAGE ENGINE v5.2 | Mode: %s" % ("DEMO" if self.demo_mode else "LIVE"))
-        LOG.info("Symbol: %s | Vol: %s | Threshold: %s" % (
-            self.config.symbol, self.config.target_volume, self.config.min_yield_threshold))
-        LOG.info("Risk: max_trades=%d | max_loss=%s | cooldown=%ds" % (
-            self.risk_config.max_daily_trades,
-            self.risk_config.max_daily_loss,
-            self.risk_config.cooldown_seconds_after_failure))
-        LOG.info("Dashboard: http://0.0.0.0:%d/status" % self.health_server.port)
-        LOG.info("=" * 70)
+        setup_log()
+        LOG.info("=" * 60)
+        LOG.info("ARBITRAGE ENGINE PRO v6.0 | Mode: %s", "DEMO" if self.demo else ("PAPER" if self.router.sandbox else "LIVE"))
+        LOG.info("Symbol: %s | Vol: %s | Threshold: %s", self.arb_cfg.symbol, self.arb_cfg.vol, self.arb_cfg.min_profit)
+        LOG.info("Dashboard: http://localhost:%d/status", self.port)
+        LOG.info("=" * 60)
 
-        self.data_sink.initialize()
-        await self.data_sink.start_background_flush()
-        await self.ledger.initialize_positions(list(self.exchanges.keys()))
-        await self.health_server.start()
+        self.sink.init()
+        await self.sink.start_bg()
+        await self.ledger.init_positions(list(self.exs.keys()))
+        await self._start_dash()
 
-        self._tasks.extend([
-            asyncio.create_task(ex.connect(), name="Conn-%s" % ex.exchange_id.value)
-            for ex in self.exchanges.values()
-        ])
-        await asyncio.sleep(1)
+        self._tasks.extend([asyncio.create_task(ex.connect(), name="Conn-" + ex.name) for ex in self.exs.values()])
+        await asyncio.sleep(2)
 
-        self._tasks.append(asyncio.create_task(self._detection_loop(), name="Detector"))
-        self._tasks.append(asyncio.create_task(self._status_reporter(), name="Reporter"))
-        self._tasks.append(asyncio.create_task(self._mark_to_market_loop(), name="MTM"))
-        self._tasks.append(asyncio.create_task(self._metrics_snapshot_loop(), name="Metrics"))
+        self._tasks.append(asyncio.create_task(self._det_loop(), name="Detector"))
+        self._tasks.append(asyncio.create_task(self._reporter(), name="Reporter"))
+        self._tasks.append(asyncio.create_task(self._mtm_loop(), name="MTM"))
+        self._tasks.append(asyncio.create_task(self._metrics_loop(), name="Metrics"))
+        LOG.info("[ENGINE] Online")
+        await self._shutdown_ev.wait()
 
-        LOG.info("[ENGINE] Online.")
-        await self._shutdown_event.wait()
+    async def _det_loop(self):
+        ex_list = list(self.exs.values())
+        fee_map = {name: ex.cfg.taker for name, ex in self.exs.items()}
 
-    async def _detection_loop(self):
-        ex_list = list(self.exchanges.values())
-        ex_a, ex_b = ex_list[0], ex_list[1]
-        ex_a_id, ex_b_id = ex_a.exchange_id, ex_b.exchange_id
-
-        fee_map = {}
-        for ec in [
-            ExchangeConfig(ExchangeId.BINANCE, "", "", Decimal("0.001")),
-            ExchangeConfig(ExchangeId.KRAKEN, "", "", Decimal("0.0026"))
-        ]:
-            if ec.exchange_id in self.exchanges:
-                fee_map[ec.exchange_id] = ec.taker_fee_rate
-
-        while not self._shutdown_event.is_set():
-            loop_start = time.time_ns()
-
-            if not await self.circuit_breaker.can_trade():
-                await asyncio.sleep(1.0)
-                continue
-            if not await self.circuit_breaker.check_daily_limits():
+        while not self._shutdown_ev.is_set():
+            t0 = time.time_ns()
+            if not await self.cb.can_trade():
                 await asyncio.sleep(1.0)
                 continue
 
-            try:
-                book_a = await ex_a.get_order_book()
-                book_b = await ex_b.get_order_book()
-                if book_a is None or book_b is None:
-                    await asyncio.sleep(self.poll_interval_ms / 1000.0)
+            books = {name: ex.get_ob() for name, ex in self.exs.items()}
+            books = {k: v for k, v in books.items() if v}
+            if len(books) < 2:
+                await asyncio.sleep(self.poll_ms / 1000.0)
+                continue
+
+            names = list(books.keys())
+            for i in range(len(names)):
+                for j in range(len(names)):
+                    if i == j:
+                        continue
+                    sig = Calc.validate(books[names[i]], books[names[j]], self.arb_cfg,
+                                        fee_map.get(names[i], Decimal("0.001")),
+                                        fee_map.get(names[j], Decimal("0.001")))
+                    if sig:
+                        sig.buy_ex = names[i]
+                        sig.sell_ex = names[j]
+                        await self.latency.record_detection((time.time_ns() - t0) // 1000)
+                        await self._process_sig(sig)
+                        break
+                else:
                     continue
+                break
 
-                sig_ab = PrecisionCalculator.validate_signal(
-                    book_a, book_b, self.config,
-                    fee_map.get(ex_a_id, Decimal("0.001")),
-                    fee_map.get(ex_b_id, Decimal("0.0026")))
-                if sig_ab:
-                    await self.latency_tracker.record_detection(
-                        (time.time_ns() - loop_start) // 1000)
-                    await self._process_signal(sig_ab)
-                    continue
+            elapsed = time.time_ns() - t0
+            sleep = max(0, int(self.poll_ms * 1e6) - elapsed)
+            if sleep > 0:
+                await asyncio.sleep(sleep / 1e9)
 
-                sig_ba = PrecisionCalculator.validate_signal(
-                    book_b, book_a, self.config,
-                    fee_map.get(ex_b_id, Decimal("0.0026")),
-                    fee_map.get(ex_a_id, Decimal("0.001")))
-                if sig_ba:
-                    await self.latency_tracker.record_detection(
-                        (time.time_ns() - loop_start) // 1000)
-                    await self._process_signal(sig_ba)
-                    continue
-
-            except Exception as e:
-                LOG.error("[DETECTOR] %s\n%s" % (e, traceback.format_exc()))
-                await self.circuit_breaker.record_failure(str(e))
-
-            elapsed = time.time_ns() - loop_start
-            sleep_ns = max(0, int(self.poll_interval_ms * 1_000_000) - elapsed)
-            if sleep_ns > 0:
-                await asyncio.sleep(sleep_ns / 1_000_000_000.0)
-
-    async def _process_signal(self, signal):
-        self._signals_detected += 1
-        self.data_sink.persist_signal(signal)
-        LOG.info("[SIGNAL] #%d | %s | Net: %s %s" % (
-            self._signals_detected, signal.execution_id,
-            signal.net_profit, signal.symbol.split('/')[1]))
+    async def _process_sig(self, sig: ArbSig):
+        self.signals_detected += 1
+        self.sink.persist_sig(sig)
+        LOG.info("[SIGNAL] #%d | %s | Net: $%s %s", self.signals_detected, sig.eid, sig.net_profit, self.arb_cfg.symbol.split("/")[1])
         try:
-            result = await self.execution_router.execute_arbitrage(signal, self.exchanges)
-            await self.latency_tracker.record_execution(result.latency_us)
-            self.data_sink.update_execution_result(result)
-            await self.ledger.record_execution(result, signal)
-            await self.alert_manager.alert_execution(signal, result)
-
-            if result.status == "FILLED":
-                await self.circuit_breaker.record_success(signal.net_profit)
-                self._signals_executed += 1
-                LOG.info("[SIGNAL] #%d EXECUTED in %dus" % (
-                    self._signals_detected, result.latency_us))
+            res = await self.router.execute(sig, self.exs)
+            await self.latency.record_execution(res.latency_us)
+            await self.sink.persist_exec(res)
+            await self.ledger.record_exec(res, sig)
+            await self.alerts.alert_exec(sig, res)
+            if res.status == "FILLED":
+                await self.cb.record_success(sig.net_profit)
+                self.signals_executed += 1
+                LOG.info("[SIGNAL] #%d EXECUTED in %dus", self.signals_detected, res.latency_us)
             else:
-                await self.circuit_breaker.record_failure(result.status)
-                LOG.warning("[SIGNAL] #%d issue: %s" % (
-                    self._signals_detected, result.status))
+                await self.cb.record_failure(res.status)
+                LOG.warning("[SIGNAL] #%d issue: %s", self.signals_detected, res.status)
         except Exception as e:
-            LOG.error("[SIGNAL] Exec failed: %s" % e)
-            await self.circuit_breaker.record_failure(str(e))
-            await self.alert_manager.alert_error(str(e))
+            LOG.error("[SIGNAL] Exec failed: %s", e)
+            await self.cb.record_failure(str(e))
+            await self.alerts.alert_err(str(e))
 
-    async def _mark_to_market_loop(self):
-        while not self._shutdown_event.is_set():
+    async def _mtm_loop(self):
+        while not self._shutdown_ev.is_set():
             try:
-                await asyncio.wait_for(
-                    self._shutdown_event.wait(), timeout=5.0)
+                await asyncio.wait_for(self._shutdown_ev.wait(), timeout=5.0)
             except asyncio.TimeoutError:
-                books = {
-                    ex_id: await m.get_order_book()
-                    for ex_id, m in self.exchanges.items()
-                }
+                books = {name: ex.get_ob() for name, ex in self.exs.items()}
                 books = {k: v for k, v in books.items() if v}
                 if books:
-                    await self.ledger.mark_to_market(books)
+                    await self.ledger.mtm(books)
 
-    async def _metrics_snapshot_loop(self):
-        while not self._shutdown_event.is_set():
+    async def _metrics_loop(self):
+        while not self._shutdown_ev.is_set():
             try:
-                await asyncio.wait_for(
-                    self._shutdown_event.wait(), timeout=2.0)
+                await asyncio.wait_for(self._shutdown_ev.wait(), timeout=2.0)
             except asyncio.TimeoutError:
-                await self.metrics_history.snapshot(self)
+                await self.history.snapshot(self)
 
-    async def _status_reporter(self):
-        while not self._shutdown_event.is_set():
+    async def _reporter(self):
+        while not self._shutdown_ev.is_set():
             try:
-                await asyncio.wait_for(
-                    self._shutdown_event.wait(), timeout=10.0)
+                await asyncio.wait_for(self._shutdown_ev.wait(), timeout=10.0)
             except asyncio.TimeoutError:
-                for ex_id, m in self.exchanges.items():
-                    LOG.info("[HEALTH] %s: %s | Msgs:%d" % (
-                        ex_id.value,
-                        "CONN" if m.is_connected else "DISC",
-                        m.messages_received))
-                rate = self._signals_executed / max(self._signals_detected, 1) * 100
-                lat = self.latency_tracker.get_metrics()
-                exec_p99 = lat["execution_us"]["p99"]
-                LOG.info("[METRICS] Sig:%d | Exec:%d | Rate:%.1f%% | Exec p99:%.0fus | P&L:%s" % (
-                    self._signals_detected,
-                    self._signals_executed,
-                    rate,
-                    exec_p99,
-                    self.ledger.get_metrics()["total_realized_pnl"]))
+                for name, ex in self.exs.items():
+                    LOG.info("[HEALTH] %s: %s | Msgs:%d", name, "CONN" if ex._connected else "DISC", ex._msgs)
+                rate = self.signals_executed / max(self.signals_detected, 1) * 100
+                lat = self.latency.metrics()
+                LOG.info("[METRICS] Sig:%d | Exec:%d | Rate:%.1f%% | Exec p99:%dus | P&L:%s",
+                         self.signals_detected, self.signals_executed, rate,
+                         lat["execution_us"]["p99"], self.ledger.metrics()["total_realized_pnl"])
 
     async def shutdown(self):
         LOG.info("[ENGINE] Shutdown...")
-        self._shutdown_event.set()
-        for task in self._tasks:
-            if not task.done():
-                task.cancel()
+        self._shutdown_ev.set()
+        for t in self._tasks:
+            if not t.done():
+                t.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
-        for m in self.exchanges.values():
-            await m.shutdown()
-        await self.data_sink.shutdown()
-        await self.health_server.shutdown()
-        LOG.info("[ENGINE] Done.")
+        for ex in self.exs.values():
+            await ex.shutdown()
+        await self.sink.shutdown()
+        await self._stop_dash()
+        LOG.info("[ENGINE] Done")
 
+    # --------------------------------------------------------------------------
+    # DASHBOARD (aiohttp)
+    # --------------------------------------------------------------------------
+    async def _start_dash(self):
+        if not AIOHTTP_OK:
+            LOG.warning("aiohttp not installed. No dashboard. Run: pip install aiohttp")
+            return
+        self._app = web.Application()
+        self._app.router.add_get("/status", self._dash_status)
+        self._app.router.add_get("/api/metrics", self._dash_api)
+        self._app.router.add_get("/api/chart_data", self._dash_charts)
+        self._app.router.add_get("/api/trades", self._dash_trades)
+        self._runner = web.AppRunner(self._app)
+        await self._runner.setup()
+        await web.TCPSite(self._runner, "0.0.0.0", self.port).start()
+        LOG.info("[DASHBOARD] http://localhost:%d/status", self.port)
 
-# =============================================================================
-# SIGNAL HANDLERS & MAIN
-# =============================================================================
+    async def _stop_dash(self):
+        if hasattr(self, "_runner") and self._runner:
+            await self._runner.cleanup()
 
-class SignalHandler:
-    def __init__(self, engine):
+    async def _dash_api(self, request):
+        return web.json_response(self._get_status_dict())
+
+    async def _dash_charts(self, request):
+        return web.json_response(self.history.chart_data())
+
+    async def _dash_trades(self, request):
+        conn = sqlite3.connect(self.sink.db)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM executions ORDER BY ts DESC LIMIT 100").fetchall()
+        conn.close()
+        return web.json_response([dict(r) for r in rows])
+
+    def _get_status_dict(self):
+        risk = self.cb.metrics()
+        lat = self.latency.metrics()
+        return {
+            "mode": "DEMO" if self.demo else ("PAPER" if self.router.sandbox else "LIVE"),
+            "symbol": self.arb_cfg.symbol,
+            "circuit_state": risk["state"],
+            "circuit_reason": risk["reason"],
+            "daily_trades": risk["daily_trades"],
+            "daily_loss": risk["daily_loss"],
+            "total_realized_pnl": self.ledger.metrics()["total_realized_pnl"],
+            "signals_detected": self.signals_detected,
+            "signals_executed": self.signals_executed,
+            "success_rate": round(self.signals_executed / max(self.signals_detected, 1) * 100, 1),
+            "detection_latency_us": lat["detection_us"],
+            "execution_latency_us": lat["execution_us"],
+            "exchanges": {name: {"connected": ex._connected, "messages": ex._msgs, "balances": {k: str(v) for k, v in ex._balances.items()}}
+                          for name, ex in self.exs.items()}
+        }
+
+    async def _dash_status(self, request):
+        st = self._get_status_dict()
+        risk = self.cb.metrics()
+        lat = self.latency.metrics()
+        chart_data = self.history.chart_data()
+
+        # Build trade rows
+        conn = sqlite3.connect(self.sink.db)
+        conn.row_factory = sqlite3.Row
+        trades = conn.execute("SELECT * FROM executions ORDER BY ts DESC LIMIT 50").fetchall()
+        conn.close()
+
+        trade_rows = ""
+        for t in trades:
+            color = "#00ff88" if t["status"] == "FILLED" else "#ff4444"
+            trade_rows += "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td style='color:%s'>%s</td><td>%s</td></tr>" % (
+                t["ts"][:19], t["buy_ex"], t["sell_ex"], t["buy_fill_px"], t["sell_fill_px"], color, t["status"], t["latency_us"])
+
+        # Build exchange rows
+        ex_rows = ""
+        for name, d in st["exchanges"].items():
+            c = d["connected"]
+            cc = "#00ff88" if c else "#ff4444"
+            ct = "CONNECTED" if c else "DISCONNECTED"
+            ex_rows += "<tr><td><strong>%s</strong></td><td style='color:%s'>%s</td><td>%d</td><td>%s</td></tr>" % (
+                name.upper(), cc, ct, d["messages"], json.dumps(d["balances"]))
+
+        mode_color = "#00ff88" if st["mode"] == "DEMO" else ("#ffaa00" if st["mode"] == "PAPER" else "#ff4444")
+        circuit_color = "#00ff88" if risk["state"] == "CLOSED" else "#ff4444"
+        circuit_text = risk["state"]
+        pnl_val = Decimal(self.ledger.metrics()["total_realized_pnl"])
+        pnl_color = "#00ff88" if pnl_val >= 0 else "#ff4444"
+
+        # Serialize chart data for JS
+        chart_json = json.dumps(chart_data)
+
+        html = """<!DOCTYPE html>
+<html>
+<head>
+<title>ARB Pro v6.0 Dashboard</title>
+<meta http-equiv="refresh" content="3">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+body{font-family:'Segoe UI',monospace;background:#0a0a0a;color:#e0e0e0;padding:20px;margin:0}
+.header{border-bottom:2px solid %s;padding-bottom:15px;margin-bottom:20px}
+.card{background:#111;border:1px solid #333;padding:15px;margin:10px 0;border-radius:8px}
+.kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:15px;margin-bottom:20px}
+.kpi{background:#111;border:1px solid #333;padding:15px;border-radius:8px;text-align:center}
+.kpi-value{font-size:28px;font-weight:bold;margin-bottom:5px}
+.kpi-label{font-size:11px;color:#888;text-transform:uppercase;letter-spacing:1px}
+.green{color:#00ff88}.red{color:#ff4444}.yellow{color:#ffaa00}.blue{color:#66ccff}
+h1{margin:0;color:%s}h2{color:#ffaa00;margin-top:0;font-size:18px}h3{color:#66ccff;font-size:16px}
+table{width:100%%;border-collapse:collapse;margin-top:10px;font-size:13px}
+th,td{padding:8px;text-align:left;border-bottom:1px solid #333}
+th{color:#ffaa00;background:#1a1a1a;font-size:12px;text-transform:uppercase}
+.chart-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:15px;margin-bottom:20px}
+.chart-box{background:#111;border:1px solid #333;padding:15px;border-radius:8px;height:280px;position:relative}
+.chart-box canvas{max-height:240px}
+.slicers{background:#111;border:1px solid #333;padding:15px;border-radius:8px;margin-bottom:20px;display:flex;flex-wrap:wrap;gap:15px;align-items:center}
+.slicers label{color:#888;font-size:12px;text-transform:uppercase;margin-right:5px}
+.slicers select,.slicers input{background:#1a1a1a;border:1px solid #444;color:#e0e0e0;padding:6px 10px;border-radius:4px;font-family:inherit}
+.trade-log{max-height:300px;overflow-y:auto}
+.circuit-badge{display:inline-block;padding:4px 12px;border-radius:12px;font-size:12px;font-weight:bold;background:%s;color:#000}
+.warning-box{background:#331a00;border-color:#ffaa00;color:#ffaa00;padding:10px 15px;border-radius:8px;margin:10px 0}
+</style>
+</head>
+<body>
+<div class="header">
+<h1>ARBITRAGE ENGINE PRO v6.0</h1>
+<p>Mode: <strong style="color:%s">%s</strong> | Symbol: <strong>%s</strong> | 
+Circuit: <span class="circuit-badge" style="background:%s">%s</span> | 
+Auto-refresh: 3s</p>
+</div>
+
+<div class="slicers">
+<div><label>Time Range</label><select id="timeRange"><option>Last 5 min</option><option>Last 15 min</option><option>Last 1 hour</option><option>All</option></select></div>
+<div><label>Min Profit ($)</label><input type="number" id="minProfit" value="0" style="width:70px"></div>
+<div><label>Exchange Pair</label><select id="exPair"><option>All</option><option>BINANCE/OKX</option><option>BINANCE/BYBIT</option><option>OKX/BYBIT</option></select></div>
+<div><label>Status</label><select id="statusFilter"><option>All</option><option>FILLED</option><option>FAILED</option></select></div>
+<div><label>Refresh</label><select id="refreshRate"><option>3s</option><option>5s</option><option>10s</option></select></div>
+</div>
+
+<div class="kpi-grid">
+<div class="kpi"><div class="kpi-value green">$%s</div><div class="kpi-label">Total P&L</div></div>
+<div class="kpi"><div class="kpi-value yellow">%.1f%%</div><div class="kpi-label">Success Rate</div></div>
+<div class="kpi"><div class="kpi-value blue">%d</div><div class="kpi-label">Signals/min</div></div>
+<div class="kpi"><div class="kpi-value">%d</div><div class="kpi-label">Trades Today</div></div>
+<div class="kpi"><div class="kpi-value">%d us</div><div class="kpi-label">Latency p50</div></div>
+<div class="kpi"><div class="kpi-value">%d us</div><div class="kpi-label">Latency p99</div></div>
+<div class="kpi"><div class="kpi-value red">$%s</div><div class="kpi-label">Daily Loss</div></div>
+<div class="kpi"><div class="kpi-value">%d bps</div><div class="kpi-label">Avg Spread</div></div>
+</div>
+
+%s
+
+<div class="chart-grid">
+<div class="chart-box"><h3>P&L Over Time</h3><canvas id="pnlChart"></canvas></div>
+<div class="chart-box"><h3>Execution Latency</h3><canvas id="latChart"></canvas></div>
+<div class="chart-box"><h3>Signal Rate</h3><canvas id="sigChart"></canvas></div>
+<div class="chart-box"><h3>Exchange Spreads (bps)</h3><canvas id="spreadChart"></canvas></div>
+<div class="chart-box"><h3>Price Divergence</h3><canvas id="priceChart"></canvas></div>
+<div class="chart-box"><h3>Circuit Breaker State</h3><canvas id="circuitChart"></canvas></div>
+</div>
+
+<div class="card">
+<h3>Exchange Status</h3>
+<table>
+<tr><th>Exchange</th><th>Status</th><th>Messages</th><th>Balances</th></tr>
+%s
+</table>
+</div>
+
+<div class="card">
+<h3>Trade Log</h3>
+<div class="trade-log">
+<table>
+<tr><th>Time</th><th>Buy Ex</th><th>Sell Ex</th><th>Buy Px</th><th>Sell Px</th><th>Status</th><th>Latency</th></tr>
+%s
+</table>
+</div>
+</div>
+
+<div class="card">
+<h3>Data Export</h3>
+<p>SQLite: <code>%s</code> | CSV: <code>%s</code> | API: <code>/api/metrics</code> | <code>/api/chart_data</code> | <code>/api/trades</code></p>
+</div>
+
+<script>
+const cd = %s;
+
+function makeLine(ctx, label, data, color, fill){
+    return new Chart(ctx, {
+        type: 'line',
+        data: { labels: cd.timestamps.map(t => new Date(t*1000).toLocaleTimeString()),
+                datasets: [{label: label, data: data, borderColor: color, backgroundColor: color+'33', fill: fill, tension: 0.3, pointRadius: 0}]},
+        options: { responsive: true, maintainAspectRatio: false, plugins: {legend: {labels: {color: '#e0e0e0'}}},
+                   scales: {x: {ticks: {color: '#888'}, grid: {color: '#333'}}, y: {ticks: {color: '#888'}, grid: {color: '#333'}}}}
+    });
+}
+
+if(cd.timestamps.length > 0){
+    makeLine(document.getElementById('pnlChart'), 'P&L ($)', cd.pnl, '#00ff88', false);
+    makeLine(document.getElementById('latChart'), 'p50', cd.exec_p50, '#66ccff', false);
+    new Chart(document.getElementById('latChart'), {
+        type: 'line',
+        data: { labels: cd.timestamps.map(t => new Date(t*1000).toLocaleTimeString()),
+                datasets: [{label: 'p50', data: cd.exec_p50, borderColor: '#66ccff', backgroundColor: '#66ccff33', fill: false, tension: 0.3, pointRadius: 0},
+                           {label: 'p99', data: cd.exec_p99, borderColor: '#ffaa00', backgroundColor: '#ffaa0033', fill: false, tension: 0.3, pointRadius: 0}]},
+        options: { responsive: true, maintainAspectRatio: false, plugins: {legend: {labels: {color: '#e0e0e0'}}},
+                   scales: {x: {ticks: {color: '#888'}, grid: {color: '#333'}}, y: {ticks: {color: '#888'}, grid: {color: '#333'}}}}
+    });
+    new Chart(document.getElementById('sigChart'), {
+        type: 'line',
+        data: { labels: cd.timestamps.map(t => new Date(t*1000).toLocaleTimeString()),
+                datasets: [{label: 'Detected', data: cd.sig_det, borderColor: '#ffaa00', backgroundColor: '#ffaa0033', fill: true, tension: 0.3, pointRadius: 0},
+                           {label: 'Executed', data: cd.sig_exec, borderColor: '#00ff88', backgroundColor: '#00ff8833', fill: true, tension: 0.3, pointRadius: 0}]},
+        options: { responsive: true, maintainAspectRatio: false, plugins: {legend: {labels: {color: '#e0e0e0'}}},
+                   scales: {x: {ticks: {color: '#888'}, grid: {color: '#333'}}, y: {ticks: {color: '#888'}, grid: {color: '#333'}}}}
+    });
+    new Chart(document.getElementById('spreadChart'), {
+        type: 'line',
+        data: { labels: cd.timestamps.map(t => new Date(t*1000).toLocaleTimeString()),
+                datasets: [{label: 'Ex A', data: cd.spread_a, borderColor: '#66ccff', backgroundColor: '#66ccff33', fill: false, tension: 0.3, pointRadius: 0},
+                           {label: 'Ex B', data: cd.spread_b, borderColor: '#ff4444', backgroundColor: '#ff444433', fill: false, tension: 0.3, pointRadius: 0}]},
+        options: { responsive: true, maintainAspectRatio: false, plugins: {legend: {labels: {color: '#e0e0e0'}}},
+                   scales: {x: {ticks: {color: '#888'}, grid: {color: '#333'}}, y: {ticks: {color: '#888'}, grid: {color: '#333'}}}}
+    });
+    new Chart(document.getElementById('priceChart'), {
+        type: 'line',
+        data: { labels: cd.timestamps.map(t => new Date(t*1000).toLocaleTimeString()),
+                datasets: [{label: 'Ex A', data: cd.price_a, borderColor: '#66ccff', backgroundColor: '#66ccff33', fill: false, tension: 0.3, pointRadius: 0},
+                           {label: 'Ex B', data: cd.price_b, borderColor: '#ffaa00', backgroundColor: '#ffaa0033', fill: false, tension: 0.3, pointRadius: 0}]},
+        options: { responsive: true, maintainAspectRatio: false, plugins: {legend: {labels: {color: '#e0e0e0'}}},
+                   scales: {x: {ticks: {color: '#888'}, grid: {color: '#333'}}, y: {ticks: {color: '#888'}, grid: {color: '#333'}}}}
+    });
+    new Chart(document.getElementById('circuitChart'), {
+        type: 'line',
+        data: { labels: cd.timestamps.map(t => new Date(t*1000).toLocaleTimeString()),
+                datasets: [{label: 'Closed=1, Open=0', data: cd.circuit, borderColor: '#ff4444', backgroundColor: '#ff444433', fill: true, tension: 0, pointRadius: 0, stepped: true}]},
+        options: { responsive: true, maintainAspectRatio: false, plugins: {legend: {labels: {color: '#e0e0e0'}}},
+                   scales: {x: {ticks: {color: '#888'}, grid: {color: '#333'}}, y: {ticks: {color: '#888'}, grid: {color: '#333'}, min: -0.1, max: 1.1}}}
+    });
+}
+</script>
+</body>
+</html>""" % (
+            mode_color, mode_color, circuit_color,
+            mode_color, st["mode"], st["symbol"], circuit_color, circuit_text,
+            self.ledger.metrics()["total_realized_pnl"],
+            st["success_rate"],
+            self.signals_detected,
+            risk["daily_trades"],
+            lat["execution_us"]["p50"],
+            lat["execution_us"]["p99"],
+            risk["daily_loss"],
+            int((sum(chart_data.get("spread_a", [0])) + sum(chart_data.get("spread_b", [0]))) / max(len(chart_data.get("spread_a", [1])), 1) * 100) if chart_data.get("spread_a") else 0,
+            "" if risk["state"] == "CLOSED" else "<div class='warning-box'><strong>CIRCUIT BREAKER ACTIVE:</strong> %s</div>" % risk["reason"],
+            ex_rows,
+            trade_rows if trade_rows else "<tr><td colspan='7' style='text-align:center;color:#888'>No trades yet</td></tr>",
+            self.sink.db,
+            self.sink.csv,
+            chart_json
+        )
+        return web.Response(text=html, content_type="text/html")
+
+# ------------------------------------------------------------------------------
+# SIGNAL HANDLER & ENTRY POINT
+# ------------------------------------------------------------------------------
+class SigHandler:
+    def __init__(self, engine: ArbEngine):
         self.engine = engine
-        self._received = False
-
+        self._got = False
     def register(self):
         try:
             loop = asyncio.get_running_loop()
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                loop.add_signal_handler(sig, self._handle, sig)
-            LOG.info("[SIGNAL] Handlers registered.")
+            for s in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(s, self._handle, s)
+            LOG.info("[SIGNAL] Handlers registered")
         except NotImplementedError:
-            LOG.warning("[SIGNAL] Not supported on this platform.")
-
+            pass
     def _handle(self, sig):
-        if self._received:
-            LOG.warning("[SIGNAL] Forced exit.")
+        if self._got:
             sys.exit(1)
-        self._received = True
-        LOG.info("[SIGNAL] %s received. Graceful shutdown..." % signal.Signals(sig).name)
+        self._got = True
+        LOG.info("[SIGNAL] %s received. Graceful shutdown...", signal.Signals(sig).name)
         asyncio.create_task(self.engine.shutdown())
 
-
-async def main():
-    parser = argparse.ArgumentParser(description="Spatial Arbitrage Engine v5.2")
-    parser.add_argument("--live", action="store_true", help="LIVE mode (needs API keys)")
-    parser.add_argument("--duration", type=int, default=120, help="Demo duration in seconds")
-    parser.add_argument("--db", default="arbitrage_engine.db", help="SQLite path")
-    parser.add_argument("--csv", default="arbitrage_signals.csv", help="CSV path")
-    parser.add_argument("--port", type=int, default=8080, help="Dashboard port")
-    parser.add_argument("--webhook", default=None, help="Webhook URL for alerts")
+async def amain():
+    parser = argparse.ArgumentParser(description="Spatial Arbitrage Engine v6.0")
+    parser.add_argument("--live", action="store_true", help="LIVE mode (needs .env)")
+    parser.add_argument("--duration", type=int, default=0, help="Demo duration in seconds (0=run forever)")
+    parser.add_argument("--port", type=int, default=8765, help="Dashboard port")
     args = parser.parse_args()
 
-    demo_mode = not args.live
+    demo = not args.live
+    arb_cfg = ArbCfg(
+        symbol=ENV.get("SYMBOL", "BTC/USDT"),
+        vol=Decimal(ENV.get("TARGET_VOLUME", "0.001")),
+        min_profit=Decimal(ENV.get("MIN_PROFIT_USD", "15.0")),
+        gas=Decimal("2.50"),
+        max_slip=Decimal(ENV.get("MAX_SLIPPAGE_PCT", "0.1")),
+        vwap_depth=int(ENV.get("VWAP_DEPTH", "20"))
+    )
+    risk_cfg = RiskCfg(
+        max_trades=int(ENV.get("MAX_DAILY_TRADES", "50")),
+        max_loss=Decimal(ENV.get("MAX_DAILY_LOSS_USD", "500")),
+        max_fail=5,
+        cooldown=int(ENV.get("COOLDOWN_SECONDS", "30")),
+        drawdown_pct=Decimal(ENV.get("MAX_DRAWDOWN_PCT", "0.05"))
+    )
 
-    arb_config = ArbitrageConfig(
-        symbol="BTC/USDT",
-        target_volume=Decimal("0.01"),
-        min_yield_threshold=Decimal("5.00"),
-        estimated_gas_fee=Decimal("2.50"),
-        max_slippage_tolerance=Decimal("0.005"),
-        vwap_depth_limit=20)
+    ex_cfgs = []
+    ex_defs = [
+        ("binance", "BINANCE_API_KEY", "BINANCE_API_SECRET", ""),
+        ("okx", "OKX_API_KEY", "OKX_API_SECRET", "OKX_PASSPHRASE"),
+        ("bybit", "BYBIT_API_KEY", "BYBIT_API_SECRET", ""),
+        ("bitget", "BITGET_API_KEY", "BITGET_API_SECRET", ""),
+    ]
 
-    risk_config = RiskConfig(
-        max_daily_trades=1000,
-        max_daily_loss=Decimal("1000.00"),
-        max_consecutive_failures=5,
-        cooldown_seconds_after_failure=30,
-        circuit_breaker_drawdown_pct=Decimal("0.05"))
-
-    if demo_mode:
-        LOG.info("[MAIN] DEMO MODE — no API keys needed.")
-        exchange_configs = [
-            ExchangeConfig(ExchangeId.BINANCE, "demo", "demo", Decimal("0.001"), True),
-            ExchangeConfig(ExchangeId.KRAKEN, "demo", "demo", Decimal("0.0026"), True)]
+    if demo:
+        LOG.info("[MAIN] DEMO MODE - no API keys needed")
+        ex_cfgs = [ExCfg(n, "demo", "demo", "", Decimal("0.001"), True) for n, _, _, _ in ex_defs]
     else:
-        LOG.info("[MAIN] LIVE MODE.")
-        exchange_configs = [
-            ExchangeConfig(
-                ExchangeId.BINANCE,
-                os.environ.get("BINANCE_API_KEY", ""),
-                os.environ.get("BINANCE_API_SECRET", ""),
-                Decimal("0.001"), True),
-            ExchangeConfig(
-                ExchangeId.KRAKEN,
-                os.environ.get("KRAKEN_API_KEY", ""),
-                os.environ.get("KRAKEN_API_SECRET", ""),
-                Decimal("0.0026"), True)]
+        LOG.info("[MAIN] LIVE MODE")
+        for name, kkey, skey, pkey in ex_defs:
+            key = ENV.get(kkey, "").strip()
+            secret = ENV.get(skey, "").strip()
+            passphrase = ENV.get(pkey, "").strip() if pkey else ""
+            if key and secret and "your_" not in key.lower() and "here" not in key.lower():
+                ex_cfgs.append(ExCfg(name, key, secret, passphrase, Decimal("0.001"), False))
+        if len(ex_cfgs) < 2:
+            LOG.error("Need 2+ exchanges with real API keys.")
+            LOG.error("Set DEMO_MODE=true in .env or paste real keys.")
+            sys.exit(1)
 
-    data_sink = DataSink(
-        db_path=args.db,
-        csv_path=args.csv,
-        flush_interval_seconds=10)
-    execution_router = ExecutionRouter(sandbox=True)
+    sink = DataSink()
+    router = ExecRouter(sandbox=demo or (ENV.get("PAPER_TRADING", "true").lower() == "true"))
+    engine = ArbEngine(arb_cfg, ex_cfgs, sink, router, risk_cfg, poll_ms=50.0, demo=demo, port=args.port)
+    SigHandler(engine).register()
 
-    engine = ArbitrageEngine(
-        arb_config=arb_config,
-        exchange_configs=exchange_configs,
-        data_sink=data_sink,
-        execution_router=execution_router,
-        risk_config=risk_config,
-        poll_interval_ms=10.0,
-        demo_mode=demo_mode,
-        webhook_url=args.webhook,
-        health_port=args.port)
-
-    SignalHandler(engine).register()
-
-    if demo_mode:
-        async def auto_shutdown():
+    if demo and args.duration > 0:
+        async def auto_stop():
             await asyncio.sleep(args.duration)
-            LOG.info("[MAIN] Demo %ds complete." % args.duration)
+            LOG.info("[MAIN] Demo %ds complete", args.duration)
             await engine.shutdown()
-        asyncio.create_task(auto_shutdown())
+        asyncio.create_task(auto_stop())
 
     try:
         await engine.start()
     except Exception as e:
-        LOG.critical("[MAIN] Fatal: %s\n%s" % (e, traceback.format_exc()))
+        LOG.critical("[MAIN] Fatal: %s\n%s", e, traceback.format_exc())
         await engine.shutdown()
         sys.exit(1)
 
-
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(amain())
     except KeyboardInterrupt:
-        LOG.info("[MAIN] Interrupted.")
+        LOG.info("[MAIN] Interrupted")
         sys.exit(0)
