@@ -1,0 +1,78 @@
+{
+  "name": "arb-pro",
+  "version": "6.0.0",
+  "description": "Spatial Arbitrage Engine Pro",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "node scripts/build-all.js",
+    "build:py": "node scripts/build-py.js",
+    "build:app": "electron-builder",
+    "postinstall": "electron-builder install-app-deps"
+  },
+  "build": {
+    "appId": "com.arbpro.desktop",
+    "productName": "ARB Pro",
+    "copyright": "Copyright 2026",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "frontend/**/*",
+      "build/**/*",
+      "node_modules/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "backend/dist",
+        "to": "backend",
+        "filter": ["**/*"]
+      }
+    ],
+    "win": {
+      "target": [{
+        "target": "nsis",
+        "arch": ["x64"]
+      }],
+      "icon": "build/icon.ico",
+      "publisherName": "ARB Pro"
+    },
+    "mac": {
+      "target": [{
+        "target": "dmg",
+        "arch": ["x64", "arm64"]
+      }],
+      "icon": "build/icon.icns",
+      "category": "public.app-category.finance"
+    },
+    "linux": {
+      "target": [{
+        "target": "AppImage",
+        "arch": ["x64"]
+      }],
+      "icon": "build",
+      "category": "Office"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "ARB Pro"
+    }
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.0"
+  },
+  "dependencies": {
+    "electron-log": "^5.1.0",
+    "electron-updater": "^6.2.0"
+  }
+}

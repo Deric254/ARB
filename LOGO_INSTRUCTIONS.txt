@@ -1,0 +1,11 @@
+CUSTOM BRANDING
+
+1. Add logo.png to this folder (square, 512x512 recommended)
+2. Run: npm run build
+3. Logo becomes app icon automatically
+
+To change app name/slogan:
+- Open the app
+- Click Settings
+- Go to Branding tab
+- Edit and Save

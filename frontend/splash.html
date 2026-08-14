@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  width: 500px; height: 350px;
+  background: linear-gradient(135deg, #0a0a0a 0%, #1a1a2e 50%, #0a0a0a 100%);
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  color: #e0e0e0; overflow: hidden;
+  border-radius: 16px;
+}
+.logo-container {
+  width: 80px; height: 80px;
+  background: linear-gradient(135deg, #00ff88, #00cc66);
+  border-radius: 20px;
+  display: flex; align-items: center; justify-content: center;
+  margin-bottom: 20px;
+  box-shadow: 0 0 40px rgba(0,255,136,0.3);
+  animation: pulse 2s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { transform: scale(1); box-shadow: 0 0 40px rgba(0,255,136,0.3); }
+  50% { transform: scale(1.05); box-shadow: 0 0 60px rgba(0,255,136,0.5); }
+}
+.logo-text { font-size: 36px; font-weight: 900; color: #0a0a0a; }
+h1 { font-size: 28px; font-weight: 800; color: #00ff88; letter-spacing: 2px; margin-bottom: 8px; }
+p { font-size: 12px; color: #888; letter-spacing: 1px; margin-bottom: 30px; }
+.loader { width: 200px; height: 3px; background: #333; border-radius: 3px; overflow: hidden; position: relative; }
+.loader::after {
+  content: ''; position: absolute; left: -50%; top: 0;
+  width: 50%; height: 100%; background: linear-gradient(90deg, transparent, #00ff88, transparent);
+  animation: slide 1.5s ease-in-out infinite;
+}
+@keyframes slide { 0% { left: -50%; } 100% { left: 100%; } }
+.status { margin-top: 20px; font-size: 11px; color: #666; letter-spacing: 1px; }
+</style>
+</head>
+<body>
+<div class="logo-container"><div class="logo-text">A</div></div>
+<h1>ARB PRO</h1>
+<p>High-Frequency Cross-Exchange Arbitrage</p>
+<div class="loader"></div>
+<div class="status">Initializing engine...</div>
+</body>
+</html>
