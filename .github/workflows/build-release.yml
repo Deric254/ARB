@@ -1,0 +1,103 @@
+name: Build and Release
+
+# Runs on every push to main. Each successful run bumps the patch version
+# (package.json), tags it, and publishes a GitHub Release with the built
+# Windows installer attached — ready to download and run.
+on:
+  push:
+    branches: [main]
+
+# Needed so the workflow can push the version-bump commit/tag and create
+# a release using the built-in token (no PAT required).
+permissions:
+  contents: write
+
+# Prevents two pushes in quick succession from racing on the version bump.
+concurrency:
+  group: build-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # The version-bump commit is tagged "[skip ci]" so this workflow doesn't
+    # trigger itself again in an infinite loop.
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Bump the patch version locally and commit it, but don't push yet —
+      # only push once the build below actually succeeds, so a failed build
+      # never leaves a broken version bump sitting in git history.
+      - name: Bump version (patch)
+        id: bump
+        run: |
+          npm --no-git-tag-version version patch
+          NEW_VERSION=$(node -p "require('./package.json').version")
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Bumped to v$NEW_VERSION"
+
+      - name: Commit version bump
+        run: |
+          git add package.json
+          git commit -m "chore: bump version to v${{ steps.bump.outputs.version }} [skip ci]"
+          git tag "v${{ steps.bump.outputs.version }}"
+
+      - name: Install Python backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install pyinstaller Pillow
+
+      - name: Install Node dependencies
+        run: npm install
+
+      - name: Build installer (icons, backend bundle, electron-builder)
+        run: npm run build
+
+      - name: Locate built installer
+        id: locate
+        run: |
+          EXE_PATH=$(ls dist/*.exe 2>/dev/null | head -n 1)
+          if [ -z "$EXE_PATH" ]; then
+            echo "::error::No .exe found in dist/ — build did not produce an installer."
+            exit 1
+          fi
+          echo "Found installer: $EXE_PATH"
+          echo "exe_path=$EXE_PATH" >> "$GITHUB_OUTPUT"
+
+      # Only reached if the build above actually succeeded.
+      - name: Push version bump and tag
+        run: |
+          git push origin HEAD:${{ github.ref_name }}
+          git push origin "v${{ steps.bump.outputs.version }}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ steps.bump.outputs.version }}"
+          name: "ARB Pro v${{ steps.bump.outputs.version }}"
+          generate_release_notes: true
+          files: ${{ steps.locate.outputs.exe_path }}

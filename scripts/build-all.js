@@ -75,8 +75,10 @@ console.log('\n[Step 3/4] Building Python backend...');
 try {
   execSync('node scripts/build-py.js', { cwd: path.join(__dirname, '..'), stdio: 'inherit' });
 } catch (e) {
-  console.error('[!] Python backend build failed');
-  console.log('    Continuing with dev mode (requires Python installed)...\n');
+  console.error('[!] Python backend build failed.');
+  console.error('    This is fatal for a packaged build — the installer would ship');
+  console.error('    with no backend inside it. Fix the PyInstaller error above and retry.');
+  process.exit(1);
 }
 
 // Step 4: Build Electron app
