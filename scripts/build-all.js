@@ -82,9 +82,13 @@ try {
 }
 
 // Step 4: Build Electron app
+// --publish never is required: electron-builder auto-detects CI environments
+// (like GitHub Actions) and, seeing a GitHub-hosted repo, tries to publish a
+// release itself unless explicitly told not to — which fails without a
+// GH_TOKEN and would conflict with the workflow's own release step anyway.
 console.log('\n[Step 4/4] Building Electron app...');
 try {
-  execSync('npx electron-builder', { cwd: path.join(__dirname, '..'), stdio: 'inherit' });
+  execSync('npx electron-builder --publish never', { cwd: path.join(__dirname, '..'), stdio: 'inherit' });
   console.log('\n========================================');
   console.log('  BUILD COMPLETE!');
   console.log('========================================');
