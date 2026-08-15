@@ -1,6 +1,6 @@
 {
   "name": "arb-pro",
-  "version": "6.0.0",
+  "version": "6.0.1",
   "description": "Spatial Arbitrage Engine Pro",
   "main": "main.js",
   "scripts": {
@@ -29,30 +29,45 @@
       {
         "from": "backend/dist",
         "to": "backend",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "win": {
-      "target": [{
-        "target": "nsis",
-        "arch": ["x64"]
-      }],
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
       "icon": "build/icon.ico",
       "publisherName": "ARB Pro"
     },
     "mac": {
-      "target": [{
-        "target": "dmg",
-        "arch": ["x64", "arm64"]
-      }],
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
       "icon": "build/icon.icns",
       "category": "public.app-category.finance"
     },
     "linux": {
-      "target": [{
-        "target": "AppImage",
-        "arch": ["x64"]
-      }],
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
       "icon": "build",
       "category": "Office"
     },
