@@ -1,0 +1,42 @@
+# --- Sensitive / local-only (never commit) ---
+# .key decrypts config.db, which stores your exchange API keys.
+# If either of these leak, treat your API keys as compromised.
+backend/.key
+backend/config.db
+backend/trades.db
+
+# --- Node / Electron ---
+node_modules/
+package-lock.json
+npm-debug.log*
+
+# --- Build outputs ---
+build/
+dist/
+backend/dist/
+backend/build/
+backend/*.spec
+*.exe
+*.dmg
+*.AppImage
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# --- Branding (optional, user-provided) ---
+# Uncomment if you don't want your custom logo tracked in git:
+# logo.png
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Logs ---
+*.log
+logs/
