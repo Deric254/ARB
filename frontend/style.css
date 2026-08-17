@@ -300,3 +300,16 @@ select:focus, input:focus {
 ::-webkit-scrollbar-track { background: var(--bg); }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+
+/* Settings page */
+.settings-container { max-width: 900px; }
+.tab-bar { display: flex; gap: 5px; margin-bottom: 20px; border-bottom: 1px solid var(--border); }
+.tab { padding: 10px 20px; cursor: pointer; border-bottom: 2px solid transparent; font-size: 14px; color: var(--text-dim); }
+.tab.active { color: var(--green); border-bottom-color: var(--green); }
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+.api-input { width: 100%; padding: 10px; background: var(--bg-hover); border: 1px solid var(--border); color: var(--text); border-radius: 6px; font-family: monospace; font-size: 13px; }
+.api-input:focus { border-color: var(--green); outline: none; }
+.save-btn { margin-top: 20px; }
+.brand-preview { text-align: center; padding: 30px; background: var(--bg-hover); border-radius: 12px; margin-bottom: 20px; }
+.brand-preview img { max-width: 80px; max-height: 80px; border-radius: 12px; margin-bottom: 10px; }

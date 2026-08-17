@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from collections import deque
 
 from fastapi import FastAPI, WebSocket
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 import uvicorn
 
 try:
@@ -111,15 +111,23 @@ class Calc:
 
     @staticmethod
     def validate(buy_book: OrderBook, sell_book: OrderBook, vol: Decimal, min_profit: Decimal, max_slip: Decimal,
-                 buy_fee: Decimal, sell_fee: Decimal, gas: Decimal, symbol: str = "BTC/USDT", depth: int = 20) -> Optional[ArbSig]:
+                 buy_fee: Decimal, sell_fee: Decimal, gas: Decimal, symbol: str = "BTC/USDT", depth: int = 20,
+                 exec_buffer_pct: Decimal = Decimal("0.0002")) -> Optional[ArbSig]:
         buy_vwap, buy_slip = Calc.vwap(buy_book.asks, vol, depth)
         sell_vwap, sell_slip = Calc.vwap(sell_book.bids, vol, depth)
         if buy_vwap == 0 or sell_vwap == 0:
             return None
         if buy_slip > max_slip or sell_slip > max_slip:
             return None
-        buy_cost = vol * buy_vwap * (Decimal("1") + buy_fee)
-        sell_rev = vol * sell_vwap * (Decimal("1") - sell_fee)
+        # Actual order placement pads the limit price by exec_buffer_pct on
+        # each leg to improve fill odds (see buy_px/sell_px in _process_sig).
+        # That's real worst-case cost that must be projected here too —
+        # otherwise a trade can look profitable on paper and still lose
+        # purely from its own execution buffer, with zero adverse market move.
+        worst_buy_px = buy_vwap * (Decimal("1") + exec_buffer_pct)
+        worst_sell_px = sell_vwap * (Decimal("1") - exec_buffer_pct)
+        buy_cost = vol * worst_buy_px * (Decimal("1") + buy_fee)
+        sell_rev = vol * worst_sell_px * (Decimal("1") - sell_fee)
         profit = sell_rev - buy_cost - gas
         if profit <= min_profit:
             return None
@@ -144,7 +152,12 @@ class ExMan:
         self.msgs = 0
         self.taker_fee = Decimal("0.001")
         self._shutdown = False
-        self._demo_base = {"binance": 65000.0, "okx": 65200.0, "bybit": 65100.0, "bitget": 64900.0}.get(name, 65000.0)
+        self._demo_base = {"binance": 65000.0, "okx": 65200.0, "bybit": 65100.0, "bitget": 64900.0, "mexc": 65050.0}.get(name, 65000.0)
+        # Portfolio-wide USDT valuation — separate from trading balances above.
+        # "How much money do I actually have here, in USDT terms" regardless
+        # of what asset it's currently sitting in.
+        self.usdt_value = Decimal("0")
+        self._last_valuation = 0.0
 
     async def connect(self):
         if self.demo:
@@ -183,30 +196,90 @@ class ExMan:
             self.last_up = time.time()
             self.msgs += 1
             self._balances = {"BTC": Decimal("0.5"), "USDT": Decimal("30000")}
+            self.usdt_value = self._balances["USDT"] + self._balances["BTC"] * Decimal(str(px))
             await asyncio.sleep(0.5)
 
     async def _ws_loop(self):
+        # Not every exchange ccxt supports offers WebSocket order book streaming
+        # (MEXC doesn't in this build, for example). Fall back to REST polling
+        # for those rather than silently never populating an order book.
+        use_ws = bool(self.ex.has.get('watchOrderBook'))
+        if not use_ws:
+            LOG.info("[%s] No WebSocket order book support — using REST polling instead", self.name)
         while self.connected and not self._shutdown:
             try:
-                raw = await self.ex.watch_order_book(self.symbol)
+                if use_ws:
+                    raw = await self.ex.watch_order_book(self.symbol)
+                else:
+                    raw = await self.ex.fetch_order_book(self.symbol)
                 self.msgs += 1
                 bids = [OBLevel(Decimal(str(b[0])), Decimal(str(b[1]))) for b in raw.get("bids", [])[:20]]
                 asks = [OBLevel(Decimal(str(a[0])), Decimal(str(a[1]))) for a in raw.get("asks", [])[:20]]
                 self._ob = OrderBook(bids, asks, time.time_ns())
                 self.last_up = time.time()
+                if not use_ws:
+                    await asyncio.sleep(max(0.2, self.ex.rateLimit / 1000))
             except Exception as e:
-                LOG.error("[%s] WS: %s", self.name, e)
+                LOG.error("[%s] Order book fetch: %s", self.name, e)
                 await asyncio.sleep(1)
 
     async def _bal_loop(self):
+        cycle = 0
         while self.connected and not self._shutdown:
             try:
                 bal = await self.ex.fetch_balance()
                 self._balances = {k: Decimal(str(v.get("free", 0))) for k, v in bal.items() if isinstance(v, dict) and Decimal(str(v.get("free", 0))) > 0}
+                # Full portfolio value (free + locked-in-orders) refreshed less
+                # often than trading balances — it's for visibility/budget
+                # awareness, not for gating trades, so it doesn't need to be
+                # as fresh and shouldn't burn extra API calls every 5s.
+                if cycle % 6 == 0:
+                    total_bal = {k: Decimal(str(v.get("total", 0))) for k, v in bal.items() if isinstance(v, dict) and Decimal(str(v.get("total", 0))) > 0}
+                    await self._refresh_usdt_value(total_bal)
+                cycle += 1
                 await asyncio.sleep(5)
             except Exception as e:
                 LOG.error("[%s] Bal: %s", self.name, e)
                 await asyncio.sleep(5)
+
+    async def _refresh_usdt_value(self, balances: Dict[str, Decimal]):
+        """Value every asset held on this exchange in USDT terms, so 'how much
+        money do I actually have here' is answerable regardless of what it's
+        currently parked in. Doesn't move any funds — valuation only."""
+        total = Decimal("0")
+        needed = [a for a in balances if a not in ("USDT", "USD", "USDC")]
+        prices: Dict[str, Decimal] = {}
+        if needed:
+            try:
+                if self.ex.has.get('fetchTickers'):
+                    symbols = [f"{a}/USDT" for a in needed if f"{a}/USDT" in self.ex.markets]
+                    if symbols:
+                        tickers = await self.ex.fetch_tickers(symbols)
+                        for sym, t in tickers.items():
+                            asset = sym.split("/")[0]
+                            last = t.get('last') or t.get('close')
+                            if last:
+                                prices[asset] = Decimal(str(last))
+                else:
+                    for a in needed:
+                        sym = f"{a}/USDT"
+                        if sym in self.ex.markets:
+                            t = await self.ex.fetch_ticker(sym)
+                            last = t.get('last') or t.get('close')
+                            if last:
+                                prices[a] = Decimal(str(last))
+            except Exception as e:
+                LOG.warning("[%s] USDT valuation price fetch: %s", self.name, e)
+
+        for asset, amt in balances.items():
+            if asset in ("USDT", "USD", "USDC"):
+                total += amt
+            elif asset in prices:
+                total += amt * prices[asset]
+            # Assets with no discoverable USDT pair are left out of the total
+            # rather than guessed at — an incomplete-but-honest number beats
+            # a fabricated one.
+        self.usdt_value = total
 
     def get_ob(self):
         if not self._ob or (time.time() - self.last_up) > 5:
@@ -272,6 +345,27 @@ class ArbEngine:
     def _init_db(self):
         conn = sqlite3.connect(self._trades_db)
         conn.execute("CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, eid TEXT, buy_ex TEXT, sell_ex TEXT, buy_px TEXT, sell_px TEXT, vol TEXT, pnl TEXT, status TEXT, latency_ms INTEGER)")
+        # Every signal that cleared the profit bar, whether it got executed or
+        # not — this is the actual record of "what opportunities existed",
+        # separate from "what we captured". Needed to honestly answer
+        # questions like "are we missing profitable trades, and why?"
+        conn.execute("""CREATE TABLE IF NOT EXISTS opportunities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, eid TEXT, symbol TEXT,
+            buy_ex TEXT, sell_ex TEXT, buy_vwap TEXT, sell_vwap TEXT, volume TEXT,
+            projected_profit TEXT, buy_slip TEXT, sell_slip TEXT,
+            selected INTEGER, outcome TEXT, detail TEXT
+        )""")
+        conn.commit()
+        conn.close()
+
+    def _log_opportunity(self, sig: 'ArbSig', selected: bool, outcome: str, detail: str = ""):
+        conn = sqlite3.connect(self._trades_db)
+        conn.execute("""INSERT INTO opportunities
+            (ts, eid, symbol, buy_ex, sell_ex, buy_vwap, sell_vwap, volume, projected_profit, buy_slip, sell_slip, selected, outcome, detail)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (datetime.utcnow().isoformat(), sig.eid, sig.symbol, sig.buy_ex, sig.sell_ex,
+             str(sig.buy_vwap), str(sig.sell_vwap), str(sig.volume), str(sig.profit),
+             str(sig.buy_slip), str(sig.sell_slip), 1 if selected else 0, outcome, detail))
         conn.commit()
         conn.close()
 
@@ -309,6 +403,9 @@ class ArbEngine:
         max_slip = Decimal(tc.get('max_slippage_pct', '0.1'))
         depth = int(tc.get('vwap_depth', 20) or 20)
         poll_ms = int(tc.get('poll_interval_ms', 50) or 50)
+        sizing_mode = tc.get('position_sizing_mode', 'fixed')
+        size_pct = Decimal(str(tc.get('position_size_pct', '0.1')))
+        fixed_cost = Decimal(str(tc.get('fixed_cost_usd', '2.50')))
         demo = mode == "demo"
         paper = mode == "paper"
 
@@ -324,7 +421,7 @@ class ArbEngine:
         self.reset_circuit()
 
         ex_cfgs = []
-        ex_defs = [("binance", "BINANCE"), ("okx", "OKX"), ("bybit", "BYBIT"), ("bitget", "BITGET")]
+        ex_defs = [("binance", "BINANCE"), ("okx", "OKX"), ("bybit", "BYBIT"), ("bitget", "BITGET"), ("mexc", "MEXC")]
 
         if demo:
             ex_cfgs = [(n, "demo", "demo", "") for n, _ in ex_defs]
@@ -354,15 +451,16 @@ class ArbEngine:
 
         self.running = True
         self._shutdown.clear()
-        self._tasks.append(asyncio.create_task(self._det_loop(vol, min_profit, max_slip, paper or demo, poll_ms, live=not (demo or paper), symbol=symbol, depth=depth)))
+        self._tasks.append(asyncio.create_task(self._det_loop(vol, min_profit, max_slip, paper or demo, poll_ms, live=not (demo or paper), symbol=symbol, depth=depth, sizing_mode=sizing_mode, size_pct=size_pct, fixed_cost=fixed_cost)))
         self._tasks.append(asyncio.create_task(self._metrics_loop()))
         LOG.info("ENGINE ONLINE")
         return True
 
-    async def _det_loop(self, vol: Decimal, min_profit: Decimal, max_slip: Decimal, paper: bool, poll_ms: int, live: bool, symbol: str, depth: int):
+    async def _det_loop(self, vol: Decimal, min_profit: Decimal, max_slip: Decimal, paper: bool, poll_ms: int, live: bool, symbol: str, depth: int, sizing_mode: str = 'fixed', size_pct: Decimal = Decimal("0.1"), fixed_cost: Decimal = Decimal("2.50")):
         fee_map = {name: ex.taker_fee for name, ex in self.exs.items()}
-        gas = Decimal("2.50")
+        gas = fixed_cost
         cycle_ns = max(1, poll_ms) * 1_000_000
+        base_ccy, quote_ccy = symbol.split("/")
 
         while not self._shutdown.is_set():
             t0 = time.time_ns()
@@ -383,20 +481,48 @@ class ArbEngine:
                     continue
 
                 names = list(books.keys())
+                candidates = []
                 for i in range(len(names)):
                     for j in range(len(names)):
                         if i == j: continue
-                        sig = Calc.validate(books[names[i]], books[names[j]], vol, min_profit, max_slip,
+
+                        pair_vol = vol
+                        if sizing_mode == 'pct_of_balance':
+                            # Size this trade off what's actually available on both
+                            # legs right now, not a number picked once and left
+                            # static — so trades scale up automatically as your
+                            # balance grows instead of staying capped forever.
+                            buy_ex, sell_ex = self.exs[names[i]], self.exs[names[j]]
+                            best_ask = books[names[i]].best_ask()
+                            if not best_ask or best_ask <= 0:
+                                continue
+                            quote_avail = buy_ex.get_bal(quote_ccy)
+                            base_avail = sell_ex.get_bal(base_ccy)
+                            max_by_buy = quote_avail / best_ask
+                            max_by_sell = base_avail
+                            pair_vol = min(max_by_buy, max_by_sell) * size_pct
+                            if pair_vol <= 0:
+                                continue
+
+                        sig = Calc.validate(books[names[i]], books[names[j]], pair_vol, min_profit, max_slip,
                                             fee_map.get(names[i], Decimal("0.001")),
                                             fee_map.get(names[j], Decimal("0.001")), gas, symbol, depth)
                         if sig:
                             sig.buy_ex = names[i]
                             sig.sell_ex = names[j]
-                            await self._process_sig(sig, paper, live)
-                            break
-                    else:
-                        continue
-                    break
+                            candidates.append(sig)
+
+                if candidates:
+                    # Always take the single most profitable opportunity available
+                    # this cycle, not just the first pair combo that happened to
+                    # qualify — with 4 exchanges there can be several valid signals
+                    # in the same instant, and they're rarely equally profitable.
+                    candidates.sort(key=lambda s: s.profit, reverse=True)
+                    best = candidates[0]
+                    for runner_up in candidates[1:]:
+                        self._log_opportunity(runner_up, selected=False, outcome="SKIPPED_LOWER_PROFIT",
+                                               detail="Best available this cycle: %s->%s $%.2f" % (best.buy_ex, best.sell_ex, best.profit))
+                    await self._process_sig(best, paper, live, fee_map)
             except Exception:
                 LOG.error("Detection loop error:\n%s", traceback.format_exc())
 
@@ -405,12 +531,38 @@ class ArbEngine:
             if sleep > 0:
                 await asyncio.sleep(sleep / 1e9)
 
-    async def _process_sig(self, sig: ArbSig, paper: bool, live: bool):
+    @staticmethod
+    def actual_fee_cost(order: dict, fill_price: Decimal, fill_qty: Decimal, fallback_rate: Decimal,
+                         base_ccy: str, quote_ccy: str) -> Decimal:
+        """Best-effort extraction of the REAL fee paid on a fill, in quote-currency
+        terms, from the exchange's own order response. Falls back to an estimate
+        (fallback_rate * notional) only if the exchange didn't report fee data —
+        estimates should never be presented as if they were the real number, but
+        having *some* deduction beats silently charging zero fee against PnL."""
+        fee_info = order.get('fee') or (order.get('fees') or [None])[0]
+        if fee_info and fee_info.get('cost') is not None:
+            try:
+                cost = Decimal(str(fee_info['cost']))
+                currency = (fee_info.get('currency') or '').upper()
+                if currency == quote_ccy.upper():
+                    return cost
+                if currency == base_ccy.upper() and fill_price > 0:
+                    return cost * fill_price
+                # Fee paid in a third currency (e.g. BNB) — we don't have a
+                # live conversion rate for it here, so fall through to the
+                # rate-based estimate rather than guess at a conversion.
+            except Exception:
+                pass
+        return fill_qty * fill_price * fallback_rate
+
+    async def _process_sig(self, sig: ArbSig, paper: bool, live: bool, fee_map: dict = None):
+        fee_map = fee_map or {}
         self.detected += 1
         buy_m = self.exs[sig.buy_ex]
         sell_m = self.exs[sig.sell_ex]
 
         if not buy_m.has_bal("buy", sig.volume, sig.buy_vwap) or not sell_m.has_bal("sell", sig.volume, sig.sell_vwap):
+            self._log_opportunity(sig, selected=True, outcome="SKIPPED_INSUFFICIENT_BALANCE")
             return
 
         # Live mode only: re-check balance right before committing capital.
@@ -425,9 +577,11 @@ class ArbEngine:
                 sell_base_free = Decimal(str(fresh_sell_bal.get(base, {}).get('free', 0)))
                 if buy_quote_free < sig.volume * sig.buy_vwap or sell_base_free < sig.volume:
                     LOG.warning("Skipping %s: fresh balance check failed (stale cache)", sig.eid)
+                    self._log_opportunity(sig, selected=True, outcome="SKIPPED_STALE_BALANCE")
                     return
             except Exception as e:
                 LOG.error("Fresh balance check failed for %s: %s — skipping trade", sig.eid, e)
+                self._log_opportunity(sig, selected=True, outcome="SKIPPED_BALANCE_CHECK_ERROR", detail=str(e))
                 return
 
         start = time.time_ns()
@@ -454,8 +608,37 @@ class ArbEngine:
                     sf = Decimal(str(sr.get("filled", 0)))
                     bavg = Decimal(str(br.get("average", br.get("price", 0))))
                     savg = Decimal(str(sr.get("average", sr.get("price", 0))))
-                    pnl = (savg - bavg) * min(bf, sf)
-                    res = ExecRes(True, bf, sf, bavg, savg, pnl, lat)
+                    matched = min(bf, sf)
+                    pnl = (savg - bavg) * matched
+                    base_ccy, quote_ccy = sig.symbol.split("/")
+                    buy_fee_actual = self.actual_fee_cost(br, bavg, bf, fee_map.get(sig.buy_ex, Decimal("0.001")), base_ccy, quote_ccy)
+                    sell_fee_actual = self.actual_fee_cost(sr, savg, sf, fee_map.get(sig.sell_ex, Decimal("0.001")), base_ccy, quote_ccy)
+                    pnl -= (buy_fee_actual + sell_fee_actual)
+
+                    # IOC orders can partially fill even with no exception raised
+                    # at all — if the two legs filled different amounts, the
+                    # unmatched leftover is a real, untracked naked position on
+                    # whichever side over-filled. Flatten it immediately rather
+                    # than silently carrying inventory drift forward.
+                    leftover = bf - sf
+                    unwind_note = ""
+                    if abs(leftover) > 0:
+                        if leftover > 0:
+                            # Bought more than we sold — flatten the excess long on buy_m.
+                            extra_pnl, unwound = await self._unwind_leg(buy_m, "sell", leftover, bavg)
+                        else:
+                            # Sold more than we bought — buy back the excess on sell_m.
+                            extra_pnl, unwound = await self._unwind_leg(sell_m, "buy", abs(leftover), savg)
+                        if unwound:
+                            pnl += extra_pnl
+                            unwind_note = "Partial-fill mismatch (buy=%s sell=%s) — leftover %s unwound" % (bf, sf, leftover)
+                            LOG.warning("%s: %s", sig.eid, unwind_note)
+                        else:
+                            unwind_note = "Partial-fill mismatch (buy=%s sell=%s) — leftover %s UNWIND FAILED" % (bf, sf, leftover)
+                            LOG.error("%s: %s", sig.eid, unwind_note)
+                            self.trip_circuit("Unhedged leftover position after partial-fill mismatch on %s/%s — manual check required" % (sig.buy_ex, sig.sell_ex))
+
+                    res = ExecRes(True, bf, sf, bavg, savg, pnl, lat, unwind_note)
                     status = "FILLED"
 
                 elif b_ok and not s_ok:
@@ -531,32 +714,50 @@ class ArbEngine:
                       str(sig.volume), str(res.pnl), status, res.latency_ms))
         conn.commit()
         conn.close()
+        self._log_opportunity(sig, selected=True, outcome=status, detail=getattr(res, 'error', '') or '')
 
     async def _unwind_leg(self, ex_mgr: 'ExMan', side: str, amount: Decimal, ref_price: Decimal) -> Tuple[Decimal, bool]:
-        """Best-effort flatten of a stray position after a leg failure.
-        side='sell' closes a long we didn't mean to hold; side='buy' replaces
-        inventory we didn't mean to spend. Prices are padded aggressively
-        (0.5%) to bias toward getting filled over getting a good price —
-        the goal here is risk reduction, not profit.
-        Returns (realized_pnl_estimate, success)."""
-        try:
-            if side == "sell":
-                px = ref_price * Decimal("0.995")
-            else:
-                px = ref_price * Decimal("1.005")
-            r = await ex_mgr.place_order(side, amount, px)
-            filled = Decimal(str(r.get("filled", 0)))
-            avg = Decimal(str(r.get("average", r.get("price", 0))))
-            if filled <= 0:
-                return Decimal("0"), False
-            if side == "sell":
-                pnl = (avg - ref_price) * filled
-            else:
-                pnl = (ref_price - avg) * filled
-            return pnl, True
-        except Exception as e:
-            LOG.error("Unwind attempt failed: %s", e)
-            return Decimal("0"), False
+        """Flatten a stray position after a leg failure or fill mismatch —
+        aggressively, and with retries. The whole point of this function is
+        'never sit exposed waiting' — a single failed attempt must not leave
+        a naked position just sitting there. Each retry accepts a worse price
+        than the last; getting flat matters far more than getting a good exit
+        price once something has already gone wrong.
+        Returns (realized_pnl, fully_exited: bool)."""
+        remaining = amount
+        total_pnl = Decimal("0")
+        # Escalating price concessions: 0.5% -> 1% -> 2% -> 4% away from
+        # reference. If even a 4%-away IOC order can't get filled, the
+        # problem isn't the price — it's genuine market/connectivity failure
+        # that no amount of further automated retrying will fix.
+        buffers = [Decimal("0.005"), Decimal("0.01"), Decimal("0.02"), Decimal("0.04")]
+
+        for attempt, buf in enumerate(buffers, start=1):
+            if remaining <= 0:
+                break
+            try:
+                px = ref_price * (Decimal("1") - buf) if side == "sell" else ref_price * (Decimal("1") + buf)
+                r = await ex_mgr.place_order(side, remaining, px)
+                filled = Decimal(str(r.get("filled", 0)))
+                avg = Decimal(str(r.get("average", r.get("price", 0))))
+                if filled > 0:
+                    leg_pnl = (avg - ref_price) * filled if side == "sell" else (ref_price - avg) * filled
+                    total_pnl += leg_pnl
+                    remaining -= filled
+                    LOG.warning("Unwind attempt %d/%d on %s: filled %s/%s at %s%% off ref",
+                                attempt, len(buffers), ex_mgr.name, filled, amount, float(buf * 100))
+                if remaining <= 0:
+                    return total_pnl, True
+            except Exception as e:
+                LOG.error("Unwind attempt %d/%d failed on %s: %s", attempt, len(buffers), ex_mgr.name, e)
+            if remaining > 0 and attempt < len(buffers):
+                await asyncio.sleep(0.3)
+
+        if remaining < amount:
+            # Partially unwound — better than nothing, but still a real gap.
+            LOG.error("Unwind on %s only partially succeeded: %s of %s still unhedged after %d attempts",
+                       ex_mgr.name, remaining, amount, len(buffers))
+        return total_pnl, remaining <= 0
 
     async def _metrics_loop(self):
         while not self._shutdown.is_set():
@@ -592,6 +793,7 @@ class ArbEngine:
         self._status = {"mode": "STOPPED", "message": "Engine stopped"}
 
     def get_status(self):
+        portfolio_usdt = sum((e.usdt_value for e in self.exs.values()), Decimal("0"))
         return {
             "mode": self._status.get("mode", "STOPPED"),
             "message": self._status.get("message", ""),
@@ -600,7 +802,8 @@ class ArbEngine:
             "executed": self.executed,
             "success_rate": round(self.executed / max(self.detected, 1) * 100, 1),
             "total_pnl": str(self._get_total_pnl()),
-            "exchanges": {n: {"connected": e.connected, "msgs": e.msgs, "balances": {k: str(v) for k, v in e._balances.items()}} for n, e in self.exs.items()},
+            "exchanges": {n: {"connected": e.connected, "msgs": e.msgs, "balances": {k: str(v) for k, v in e._balances.items()}, "usdt_value": str(e.usdt_value)} for n, e in self.exs.items()},
+            "portfolio_usdt_value": str(portfolio_usdt),
             "history": list(self._history),
             "circuit_state": "OPEN" if self._circuit_open else "CLOSED",
             "circuit_reason": self._circuit_reason,
@@ -615,6 +818,69 @@ class ArbEngine:
         rows = conn.execute("SELECT * FROM trades ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
         conn.close()
         return [dict(r) for r in rows]
+
+    def get_opportunities(self, limit: int = 200):
+        conn = sqlite3.connect(self._trades_db)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM opportunities ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    def get_analytics(self):
+        """Aggregate stats for analytics/presentation — real numbers pulled
+        straight from the trades/opportunities tables, not estimates."""
+        conn = sqlite3.connect(self._trades_db)
+        conn.row_factory = sqlite3.Row
+
+        trades = [dict(r) for r in conn.execute("SELECT * FROM trades").fetchall()]
+        opps = [dict(r) for r in conn.execute("SELECT * FROM opportunities").fetchall()]
+        conn.close()
+
+        filled = [t for t in trades if t['status'] in ('FILLED', 'UNWOUND')]
+        pnls = [Decimal(t['pnl']) for t in filled]
+        total_pnl = sum(pnls) if pnls else Decimal("0")
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p <= 0]
+
+        # Which exchange pair has actually been most profitable, on average —
+        # this is the real answer to "which opportunities should we favor",
+        # grounded in what actually happened rather than a guess.
+        pair_stats = {}
+        for t in filled:
+            key = f"{t['buy_ex']}->{t['sell_ex']}"
+            pair_stats.setdefault(key, {"count": 0, "total_pnl": Decimal("0")})
+            pair_stats[key]["count"] += 1
+            pair_stats[key]["total_pnl"] += Decimal(t['pnl'])
+        pair_summary = sorted(
+            [{"pair": k, "trades": v["count"], "total_pnl": str(v["total_pnl"]),
+              "avg_pnl": str(v["total_pnl"] / v["count"])} for k, v in pair_stats.items()],
+            key=lambda x: Decimal(x["total_pnl"]), reverse=True
+        )
+
+        skip_reasons = {}
+        for o in opps:
+            if o['outcome'] not in ('FILLED', 'UNWOUND'):
+                skip_reasons[o['outcome']] = skip_reasons.get(o['outcome'], 0) + 1
+
+        selected_opps = [o for o in opps if o['selected']]
+        captured = len([o for o in selected_opps if o['outcome'] in ('FILLED', 'UNWOUND')])
+
+        return {
+            "total_trades": len(filled),
+            "total_pnl": str(total_pnl),
+            "win_count": len(wins),
+            "loss_count": len(losses),
+            "win_rate_pct": round(len(wins) / len(filled) * 100, 1) if filled else 0.0,
+            "avg_win": str(sum(wins) / len(wins)) if wins else "0",
+            "avg_loss": str(sum(losses) / len(losses)) if losses else "0",
+            "best_trade": str(max(pnls)) if pnls else "0",
+            "worst_trade": str(min(pnls)) if pnls else "0",
+            "opportunities_seen": len(selected_opps),
+            "opportunities_captured": captured,
+            "capture_rate_pct": round(captured / len(selected_opps) * 100, 1) if selected_opps else 0.0,
+            "skip_reasons": skip_reasons,
+            "pair_performance": pair_summary,
+        }
 
 # ------------------------------------------------------------------
 # FASTAPI APP
@@ -634,6 +900,26 @@ def get_status():
 @app.get("/api/trades")
 def get_trades(limit: int = 100):
     return engine.get_trades(limit)
+
+@app.get("/api/opportunities")
+def get_opportunities(limit: int = 200):
+    return engine.get_opportunities(limit)
+
+@app.get("/api/analytics")
+def get_analytics():
+    return engine.get_analytics()
+
+@app.get("/api/analytics/export")
+def export_analytics_csv():
+    import io
+    trades = engine.get_trades(100000)
+    buf = io.StringIO()
+    if trades:
+        writer = csv.DictWriter(buf, fieldnames=list(trades[0].keys()))
+        writer.writeheader()
+        writer.writerows(trades)
+    return Response(content=buf.getvalue(), media_type="text/csv",
+                     headers={"Content-Disposition": "attachment; filename=arb_pro_trades.csv"})
 
 @app.get("/api/config")
 def get_config():

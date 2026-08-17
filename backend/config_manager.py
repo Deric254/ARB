@@ -87,7 +87,17 @@ class ConfigManager:
             'cooldown_seconds': 30,
             'max_drawdown_pct': '0.05',
             'paper_trading': True,
-            'demo_mode': True
+            'demo_mode': True,
+            # Position sizing: 'fixed' uses target_volume as-is every trade.
+            # 'pct_of_balance' sizes each trade as a % of whatever's actually
+            # available on both legs, so trade size grows automatically as
+            # your balance grows instead of staying stuck at one number.
+            'position_sizing_mode': 'fixed',
+            'position_size_pct': '0.1',
+            # Flat per-trade overhead (covers execution slippage buffer,
+            # withdrawal/network costs if you ever add transfers, etc.) —
+            # subtracted from projected profit before a trade is considered.
+            'fixed_cost_usd': '2.50',
         }
 
     def save_branding(self, name: str, slogan: str):

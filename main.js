@@ -15,7 +15,6 @@ const FRONTEND_DIR = path.join(RESOURCES_PATH, 'frontend');
 const BUILD_DIR = path.join(RESOURCES_PATH, 'build');
 
 let mainWindow = null;
-let settingsWindow = null;
 let splashWindow = null;
 let tray = null;
 let backendProcess = null;
@@ -193,27 +192,13 @@ function createMainWindow() {
   });
 }
 
-function createSettingsWindow() {
-  if (settingsWindow) {
-    settingsWindow.focus();
-    return;
+function showMainWindowAndGoToSettings() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createMainWindow();
   }
-  settingsWindow = new BrowserWindow({
-    width: 950,
-    height: 750,
-    parent: mainWindow,
-    modal: false,
-    title: 'Settings - ARB Pro',
-    icon: getIcon(),
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      webSecurity: false
-    }
-  });
-  settingsWindow.loadFile(path.join(FRONTEND_DIR, 'settings.html'));
-  settingsWindow.on('closed', () => { settingsWindow = null; });
+  mainWindow.show();
+  mainWindow.focus();
+  mainWindow.webContents.send('navigate-settings');
 }
 
 function getIcon() {
@@ -233,7 +218,7 @@ function createTray() {
   tray = new Tray(nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 }));
   const contextMenu = Menu.buildFromTemplate([
     { label: 'Show ARB Pro', click: () => { if (mainWindow) mainWindow.show(); } },
-    { label: 'Settings', click: createSettingsWindow },
+    { label: 'Settings', click: showMainWindowAndGoToSettings },
     { type: 'separator' },
     { label: 'Quit', click: () => { app.quit(); } }
   ]);
@@ -287,7 +272,6 @@ app.on('activate', () => {
 });
 
 // IPC handlers
-ipcMain.handle('open-settings', () => createSettingsWindow());
 ipcMain.handle('get-app-version', () => app.getVersion());
 ipcMain.handle('select-logo', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {

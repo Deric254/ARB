@@ -23,7 +23,11 @@
       <svg viewBox="0 0 24 24"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zM9 17H7v-7h2v7zm4 0h-2V7h2v10zm4 0h-2v-4h2v4z"/></svg>
       Trade Log
     </div>
-    <div class="nav-item" onclick="openSettings()">
+    <div class="nav-item" onclick="showPage('analytics')">
+      <svg viewBox="0 0 24 24"><path d="M16 6l2.29 2.29-4.88 4.88-4-4L2 16.59 3.41 18l6-6 4 4 6.3-6.29L22 12V6z"/></svg>
+      Analytics
+    </div>
+    <div class="nav-item" onclick="showPage('settings')">
       <svg viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.488.488 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L3.16 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
       Settings
     </div>
@@ -32,7 +36,7 @@
 
 <div class="main">
   <div class="header-bar">
-    <h2>Dashboard</h2>
+    <h2 id="pageTitle">Dashboard</h2>
     <div style="display:flex;gap:10px;align-items:center;">
       <span id="modeBadge" class="mode-badge mode-stopped">Stopped</span>
       <select id="modeSelect">
@@ -55,6 +59,7 @@
       <div class="kpi"><div class="kpi-value" id="kpiSpread" style="color:var(--yellow)">0 bps</div><div class="kpi-label">Avg Spread</div></div>
       <div class="kpi"><div class="kpi-value" id="kpiDaily" style="color:var(--text)">0</div><div class="kpi-label">Daily Trades</div></div>
       <div class="kpi"><div class="kpi-value" id="kpiCircuit" style="color:var(--green)">CLOSED</div><div class="kpi-label">Circuit Breaker</div></div>
+      <div class="kpi"><div class="kpi-value" id="kpiPortfolio" style="color:var(--green)">$0.00</div><div class="kpi-label">Portfolio Value (USDT)</div></div>
     </div>
 
     <div class="chart-grid">
@@ -83,6 +88,139 @@
           <thead><tr><th>Time</th><th>ID</th><th>Buy Ex</th><th>Sell Ex</th><th>Buy Px</th><th>Sell Px</th><th>Volume</th><th>PnL</th><th>Status</th><th>Latency</th></tr></thead>
           <tbody id="tradeTable"></tbody>
         </table>
+      </div>
+    </div>
+  </div>
+
+  <div id="analyticsPage" class="hidden">
+    <div class="header-bar" style="padding:0 0 15px 0;justify-content:flex-end;">
+      <button class="btn btn-blue" onclick="exportAnalyticsCsv()">Export CSV</button>
+    </div>
+
+    <div class="kpi-grid">
+      <div class="kpi"><div class="kpi-value" id="anTotalPnl" style="color:var(--green)">$0.00</div><div class="kpi-label">Total P&L (Filled Trades)</div></div>
+      <div class="kpi"><div class="kpi-value" id="anWinRate" style="color:var(--yellow)">0%</div><div class="kpi-label">Win Rate</div></div>
+      <div class="kpi"><div class="kpi-value" id="anCaptureRate" style="color:var(--blue)">0%</div><div class="kpi-label">Capture Rate</div></div>
+      <div class="kpi"><div class="kpi-value" id="anTrades" style="color:var(--text)">0</div><div class="kpi-label">Total Trades</div></div>
+      <div class="kpi"><div class="kpi-value" id="anBestTrade" style="color:var(--green)">$0.00</div><div class="kpi-label">Best Trade</div></div>
+      <div class="kpi"><div class="kpi-value" id="anAvgWin" style="color:var(--green)">$0.00</div><div class="kpi-label">Avg Win</div></div>
+    </div>
+
+    <div class="card">
+      <h3>Performance by Exchange Pair</h3>
+      <p style="color:var(--text-dim);font-size:12px;margin:-5px 0 12px 0;">Which pairs have actually made the most money — real numbers from executed trades, not projections.</p>
+      <table>
+        <thead><tr><th>Pair</th><th>Trades</th><th>Total P&L</th><th>Avg P&L / Trade</th></tr></thead>
+        <tbody id="pairPerfTable"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>Missed Opportunities</h3>
+      <p style="color:var(--text-dim);font-size:12px;margin:-5px 0 12px 0;">Signals that cleared the profit bar but weren't captured, and why.</p>
+      <table>
+        <thead><tr><th>Reason</th><th>Count</th></tr></thead>
+        <tbody id="skipReasonTable"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="settingsPage" class="hidden">
+    <div class="settings-container">
+      <div class="tab-bar">
+        <div class="tab active" data-tab="apis" onclick="showSettingsTab('apis', this)">API Keys</div>
+        <div class="tab" data-tab="trading" onclick="showSettingsTab('trading', this)">Trading</div>
+        <div class="tab" data-tab="branding" onclick="showSettingsTab('branding', this)">Branding</div>
+      </div>
+
+      <!-- API KEYS TAB -->
+      <div id="apisTab" class="tab-content active">
+        <div class="alert-box">
+          <strong>Security:</strong> API keys are encrypted and stored locally. Enable only <strong>Spot Trading</strong> permission. Never enable withdrawals.
+        </div>
+
+        <div class="exchange-card">
+          <h4>Binance</h4>
+          <div class="form-group"><label>API Key</label><input type="text" class="api-input" id="binance_key" placeholder="Paste your Binance API key"></div>
+          <div class="form-group"><label>API Secret</label><input type="password" class="api-input" id="binance_secret" placeholder="Paste your Binance API secret"></div>
+          <button class="btn btn-blue" onclick="saveKeys('binance')">Save Binance Keys</button>
+        </div>
+
+        <div class="exchange-card">
+          <h4>OKX</h4>
+          <div class="form-group"><label>API Key</label><input type="text" class="api-input" id="okx_key" placeholder="Paste your OKX API key"></div>
+          <div class="form-group"><label>API Secret</label><input type="password" class="api-input" id="okx_secret" placeholder="Paste your OKX API secret"></div>
+          <div class="form-group"><label>Passphrase</label><input type="password" class="api-input" id="okx_passphrase" placeholder="Paste your OKX passphrase"></div>
+          <button class="btn btn-blue" onclick="saveKeys('okx')">Save OKX Keys</button>
+        </div>
+
+        <div class="exchange-card">
+          <h4>Bybit</h4>
+          <div class="form-group"><label>API Key</label><input type="text" class="api-input" id="bybit_key" placeholder="Paste your Bybit API key"></div>
+          <div class="form-group"><label>API Secret</label><input type="password" class="api-input" id="bybit_secret" placeholder="Paste your Bybit API secret"></div>
+          <button class="btn btn-blue" onclick="saveKeys('bybit')">Save Bybit Keys</button>
+        </div>
+
+        <div class="exchange-card">
+          <h4>Bitget</h4>
+          <div class="form-group"><label>API Key</label><input type="text" class="api-input" id="bitget_key" placeholder="Paste your Bitget API key"></div>
+          <div class="form-group"><label>API Secret</label><input type="password" class="api-input" id="bitget_secret" placeholder="Paste your Bitget API secret"></div>
+          <button class="btn btn-blue" onclick="saveKeys('bitget')">Save Bitget Keys</button>
+        </div>
+
+        <div class="exchange-card">
+          <h4>MEXC</h4>
+          <div class="form-group"><label>API Key</label><input type="text" class="api-input" id="mexc_key" placeholder="Paste your MEXC API key"></div>
+          <div class="form-group"><label>API Secret</label><input type="password" class="api-input" id="mexc_secret" placeholder="Paste your MEXC API secret"></div>
+          <button class="btn btn-blue" onclick="saveKeys('mexc')">Save MEXC Keys</button>
+        </div>
+      </div>
+
+      <!-- TRADING TAB -->
+      <div id="tradingTab" class="tab-content">
+        <div class="form-row">
+          <div class="form-group"><label>Trading Symbol</label><input type="text" id="symbol" value="BTC/USDT"></div>
+          <div class="form-group"><label>Target Volume (fixed sizing)</label><input type="text" id="target_volume" value="0.001"></div>
+          <div class="form-group"><label>Min Profit ($)</label><input type="text" id="min_profit" value="15.0"></div>
+          <div class="form-group"><label>Max Slippage (%)</label><input type="text" id="max_slippage" value="0.1"></div>
+          <div class="form-group"><label>VWAP Depth</label><input type="number" id="vwap_depth" value="20"></div>
+          <div class="form-group"><label>Poll Interval (ms)</label><input type="number" id="poll_ms" value="50"></div>
+          <div class="form-group"><label>Max Daily Trades</label><input type="number" id="max_trades" value="50"></div>
+          <div class="form-group"><label>Max Daily Loss ($)</label><input type="text" id="max_loss" value="500"></div>
+          <div class="form-group"><label>Cooldown (sec)</label><input type="number" id="cooldown" value="30"></div>
+          <div class="form-group"><label>Max Drawdown (%)</label><input type="text" id="drawdown" value="0.05"></div>
+          <div class="form-group">
+            <label>Position Sizing</label>
+            <select id="sizing_mode" onchange="document.getElementById('sizePctGroup').style.display = this.value === 'pct_of_balance' ? 'block' : 'none'">
+              <option value="fixed">Fixed (use Target Volume above)</option>
+              <option value="pct_of_balance">% of available balance (scales as you grow)</option>
+            </select>
+          </div>
+          <div class="form-group" id="sizePctGroup" style="display:none;">
+            <label>Position Size (% of available balance)</label>
+            <input type="text" id="size_pct" value="0.1">
+          </div>
+          <div class="form-group"><label>Fixed Cost per Trade ($)</label><input type="text" id="fixed_cost" value="2.50"></div>
+        </div>
+        <button class="btn btn-green save-btn" onclick="saveTradingConfig()">Save Trading Settings</button>
+      </div>
+
+      <!-- BRANDING TAB -->
+      <div id="brandingTab" class="tab-content">
+        <div class="brand-preview">
+          <img id="previewLogo" src="../logo.png" onerror="this.style.display='none'" alt="Logo">
+          <h2 id="previewName">ARB Pro</h2>
+          <p id="previewSlogan">High-Frequency Cross-Exchange Arbitrage</p>
+        </div>
+        <div class="form-group"><label>App Name</label><input type="text" id="brand_name" value="ARB Pro" oninput="updatePreview()"></div>
+        <div class="form-group"><label>Slogan</label><input type="text" id="brand_slogan" value="High-Frequency Cross-Exchange Arbitrage" oninput="updatePreview()"></div>
+        <div class="form-group">
+          <label>Logo</label>
+          <p style="color:var(--text-dim);font-size:12px;margin-bottom:8px;">Drop logo.png in the app folder and click Refresh, or select a file.</p>
+          <button class="btn btn-blue" onclick="selectLogoFile()">Select Logo File</button>
+          <button class="btn btn-yellow" onclick="location.reload()">Refresh Preview</button>
+        </div>
+        <button class="btn btn-green save-btn" onclick="saveBranding()">Save Branding</button>
       </div>
     </div>
   </div>
