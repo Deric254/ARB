@@ -1,5 +1,12 @@
 const API_BASE = 'http://localhost:8765';
+let API_TOKEN = '';
 let ws = null;
+
+// Attaches the per-launch auth token (fetched from the Electron main
+// process) to every backend request, on top of any caller-supplied headers.
+function authHeaders(extra = {}) {
+  return API_TOKEN ? { ...extra, 'Authorization': 'Bearer ' + API_TOKEN } : extra;
+}
 let charts = {};
 let historyData = { timestamps: [], pnl: [], detected: [], executed: [], spread_a: [], spread_b: [], price_a: [], price_b: [], circuit: [] };
 
@@ -67,7 +74,7 @@ function updateExTable(data) {
 
 async function loadTrades() {
   try {
-    const res = await fetch(`${API_BASE}/api/trades?limit=50`);
+    const res = await fetch(`${API_BASE}/api/trades?limit=50`, { headers: authHeaders() });
     const trades = await res.json();
     const tbody = document.getElementById('tradeTable');
     let html = '';
@@ -100,7 +107,7 @@ function updateCharts(data) {
 
 async function fetchStatus() {
   try {
-    const res = await fetch(`${API_BASE}/api/status`);
+    const res = await fetch(`${API_BASE}/api/status`, { headers: authHeaders() });
     const data = await res.json();
     updateKPIs(data);
     updateExTable(data);
@@ -116,7 +123,7 @@ async function startEngine() {
   const mode = document.getElementById('modeSelect').value;
   try {
     const res = await fetch(`${API_BASE}/api/engine/start`, {
-      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode})
+      method: 'POST', headers: authHeaders({'Content-Type': 'application/json'}), body: JSON.stringify({mode})
     });
     const json = await res.json();
     if (json.ok) {
@@ -130,7 +137,7 @@ async function startEngine() {
 
 async function stopEngine() {
   try {
-    await fetch(`${API_BASE}/api/engine/stop`, {method: 'POST'});
+    await fetch(`${API_BASE}/api/engine/stop`, {method: 'POST', headers: authHeaders()});
     document.getElementById('startBtn').classList.remove('hidden');
     document.getElementById('stopBtn').classList.add('hidden');
   } catch (e) { alert('Error: ' + e.message); }
@@ -153,13 +160,26 @@ function showPage(page) {
   if (page === 'analytics') loadAnalytics();
 }
 
-function exportAnalyticsCsv() {
-  window.open(`${API_BASE}/api/analytics/export`, '_blank');
+async function exportAnalyticsCsv() {
+  // window.open() can't attach an auth header, so this endpoint is
+  // fetched (authenticated) and saved via a Blob link instead.
+  try {
+    const res = await fetch(`${API_BASE}/api/analytics/export`, { headers: authHeaders() });
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'arb_pro_trades.csv';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) { alert('Export failed: ' + e.message); }
 }
 
 async function loadAnalytics() {
   try {
-    const res = await fetch(`${API_BASE}/api/analytics`);
+    const res = await fetch(`${API_BASE}/api/analytics`, { headers: authHeaders() });
     const a = await res.json();
 
     document.getElementById('anTotalPnl').textContent = '$' + parseFloat(a.total_pnl).toFixed(2);
@@ -203,7 +223,7 @@ async function saveKeys(exchange) {
   };
   try {
     const res = await fetch(`${API_BASE}/api/config/keys/${exchange}`, {
-      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data)
+      method: 'POST', headers: authHeaders({'Content-Type': 'application/json'}), body: JSON.stringify(data)
     });
     const json = await res.json();
     alert(json.ok ? `${exchange.toUpperCase()} keys saved!` : 'Failed to save');
@@ -230,7 +250,7 @@ async function saveTradingConfig() {
   };
   try {
     const res = await fetch(`${API_BASE}/api/config/trading`, {
-      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data)
+      method: 'POST', headers: authHeaders({'Content-Type': 'application/json'}), body: JSON.stringify(data)
     });
     const json = await res.json();
     alert(json.ok ? 'Trading settings saved!' : 'Failed to save');
@@ -249,7 +269,7 @@ async function saveBranding() {
   };
   try {
     const res = await fetch(`${API_BASE}/api/config/branding`, {
-      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data)
+      method: 'POST', headers: authHeaders({'Content-Type': 'application/json'}), body: JSON.stringify(data)
     });
     const json = await res.json();
     if (json.ok) {
@@ -272,7 +292,7 @@ async function selectLogoFile() {
 
 async function loadSettingsConfig() {
   try {
-    const res = await fetch(`${API_BASE}/api/config`);
+    const res = await fetch(`${API_BASE}/api/config`, { headers: authHeaders() });
     const cfg = await res.json();
     if (cfg.trading) {
       const t = cfg.trading;
@@ -301,7 +321,7 @@ async function loadSettingsConfig() {
 
 async function loadBranding() {
   try {
-    const res = await fetch(`${API_BASE}/api/config`);
+    const res = await fetch(`${API_BASE}/api/config`, { headers: authHeaders() });
     const cfg = await res.json();
     if (cfg.branding) {
       document.getElementById('brandName').textContent = cfg.branding.name || 'ARB Pro';
@@ -313,7 +333,7 @@ async function loadBranding() {
 // WebSocket for real-time updates
 function connectWS() {
   try {
-    ws = new WebSocket('ws://localhost:8765/ws');
+    ws = new WebSocket(`ws://localhost:8765/ws?token=${encodeURIComponent(API_TOKEN)}`);
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
       updateKPIs(data);
@@ -324,13 +344,19 @@ function connectWS() {
 }
 
 // Init
-initCharts();
-loadBranding();
-fetchStatus();
-loadTrades();
-connectWS();
-setInterval(fetchStatus, 3000);
-setInterval(loadTrades, 5000);
+async function init() {
+  if (window.electronAPI && window.electronAPI.getApiToken) {
+    API_TOKEN = await window.electronAPI.getApiToken();
+  }
+  initCharts();
+  loadBranding();
+  fetchStatus();
+  loadTrades();
+  connectWS();
+  setInterval(fetchStatus, 3000);
+  setInterval(loadTrades, 5000);
+}
+init();
 
 if (window.electronAPI && window.electronAPI.onNavigateSettings) {
   window.electronAPI.onNavigateSettings(() => showPage('settings'));

@@ -14,6 +14,7 @@ import json
 import logging
 import csv
 import random
+import secrets
 import traceback
 from decimal import Decimal
 from datetime import datetime
@@ -21,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from collections import deque
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, Header, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 import uvicorn
 
@@ -43,6 +44,26 @@ LOG = logging.getLogger("ARB-BACKEND")
 
 # Detect if running from PyInstaller bundle
 BUNDLE_DIR = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+
+# ------------------------------------------------------------------
+# AUTH
+# API_TOKEN is normally generated per-launch by the Electron main
+# process and passed in via ARB_TOKEN. If it's missing (e.g. backend
+# started standalone for dev/debugging), generate one here so the
+# API is never left unauthenticated, and log it so it's still usable.
+# ------------------------------------------------------------------
+API_TOKEN = os.environ.get("ARB_TOKEN", "").strip()
+if not API_TOKEN:
+    API_TOKEN = secrets.token_hex(32)
+    LOG.warning("ARB_TOKEN not set by launcher - generated a standalone dev token: %s", API_TOKEN)
+
+def verify_token(authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = authorization[len("Bearer "):]
+    if not secrets.compare_digest(token, API_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return True
 
 # ------------------------------------------------------------------
 # DATA STRUCTURES
@@ -893,23 +914,23 @@ engine = ArbEngine(cfg_mgr)
 def root():
     return {"status": "ARB Pro Backend v6.0", "mode": engine._status.get("mode", "STOPPED")}
 
-@app.get("/api/status")
+@app.get("/api/status", dependencies=[Depends(verify_token)])
 def get_status():
     return engine.get_status()
 
-@app.get("/api/trades")
+@app.get("/api/trades", dependencies=[Depends(verify_token)])
 def get_trades(limit: int = 100):
     return engine.get_trades(limit)
 
-@app.get("/api/opportunities")
+@app.get("/api/opportunities", dependencies=[Depends(verify_token)])
 def get_opportunities(limit: int = 200):
     return engine.get_opportunities(limit)
 
-@app.get("/api/analytics")
+@app.get("/api/analytics", dependencies=[Depends(verify_token)])
 def get_analytics():
     return engine.get_analytics()
 
-@app.get("/api/analytics/export")
+@app.get("/api/analytics/export", dependencies=[Depends(verify_token)])
 def export_analytics_csv():
     import io
     trades = engine.get_trades(100000)
@@ -921,45 +942,48 @@ def export_analytics_csv():
     return Response(content=buf.getvalue(), media_type="text/csv",
                      headers={"Content-Disposition": "attachment; filename=arb_pro_trades.csv"})
 
-@app.get("/api/config")
+@app.get("/api/config", dependencies=[Depends(verify_token)])
 def get_config():
     tc = cfg_mgr.get_trading_config()
     branding = cfg_mgr.get_branding()
     return {"trading": tc, "branding": branding}
 
-@app.post("/api/config/trading")
+@app.post("/api/config/trading", dependencies=[Depends(verify_token)])
 async def save_trading_config(data: dict):
     cfg_mgr.save_trading_config(data)
     return {"ok": True}
 
-@app.post("/api/config/keys/{exchange}")
+@app.post("/api/config/keys/{exchange}", dependencies=[Depends(verify_token)])
 async def save_keys(exchange: str, data: dict):
     cfg_mgr.save_exchange_keys(exchange, data.get("api_key", ""), data.get("api_secret", ""), data.get("passphrase", ""))
     return {"ok": True}
 
-@app.post("/api/config/branding")
+@app.post("/api/config/branding", dependencies=[Depends(verify_token)])
 async def save_branding(data: dict):
     cfg_mgr.save_branding(data.get("name", "ARB Pro"), data.get("slogan", ""))
     return {"ok": True}
 
-@app.post("/api/engine/start")
+@app.post("/api/engine/start", dependencies=[Depends(verify_token)])
 async def start_engine(data: dict):
     mode = data.get("mode", "demo")
     ok = await engine.start(mode)
     return {"ok": ok, "mode": mode}
 
-@app.post("/api/engine/stop")
+@app.post("/api/engine/stop", dependencies=[Depends(verify_token)])
 async def stop_engine():
     await engine.stop()
     return {"ok": True}
 
-@app.post("/api/engine/reset-circuit")
+@app.post("/api/engine/reset-circuit", dependencies=[Depends(verify_token)])
 async def reset_circuit():
     engine.reset_circuit()
     return {"ok": True}
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_endpoint(websocket: WebSocket, token: str = Query(None)):
+    if not token or not secrets.compare_digest(token, API_TOKEN):
+        await websocket.close(code=4401)
+        return
     await websocket.accept()
     try:
         while True:
@@ -973,5 +997,5 @@ async def websocket_endpoint(websocket: WebSocket):
 # ------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("ARB_PORT", 8765))
-    LOG.info("Starting ARB Pro Backend on port %d", port)
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+    LOG.info("Starting ARB Pro Backend on 127.0.0.1:%d", port)
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")

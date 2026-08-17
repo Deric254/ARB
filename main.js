@@ -3,6 +3,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const http = require('http');
+const crypto = require('crypto');
 const log = require('electron-log');
 
 log.initialize();
@@ -20,6 +21,10 @@ let tray = null;
 let backendProcess = null;
 let backendPort = 8765;
 let backendReady = false;
+// Generated fresh each launch, never written to disk. Passed to the
+// backend via env var and to the renderer via IPC so every request
+// can be authenticated without a login step.
+const apiToken = crypto.randomBytes(32).toString('hex');
 
 // Find backend executable
 function getBackendExe() {
@@ -105,7 +110,7 @@ function startBackend() {
   backendProcess = spawn(cmd, args, {
     cwd: path.dirname(cmd),
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, ARB_PORT: backendPort, ARB_DESKTOP: '1' }
+    env: { ...process.env, ARB_PORT: backendPort, ARB_DESKTOP: '1', ARB_TOKEN: apiToken }
   });
 
   backendProcess.stdout.on('data', (data) => {
@@ -281,6 +286,7 @@ ipcMain.handle('select-logo', async () => {
   return result.filePaths[0] || null;
 });
 ipcMain.handle('get-backend-status', () => ({ ready: backendReady, port: backendPort }));
+ipcMain.handle('get-api-token', () => apiToken);
 ipcMain.handle('restart-backend', async () => {
   if (backendProcess) backendProcess.kill();
   backendReady = false;
