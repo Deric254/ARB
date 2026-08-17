@@ -1,6 +1,10 @@
 {
   "name": "arb-pro",
+<<<<<<< HEAD
   "version": "6.0.0",
+=======
+  "version": "6.0.2",
+>>>>>>> 0c27857b07755ac0ae136b94e6a2dcbfba856d39
   "description": "Spatial Arbitrage Engine Pro",
   "main": "main.js",
   "scripts": {
