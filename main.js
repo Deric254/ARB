@@ -110,7 +110,13 @@ function startBackend() {
   backendProcess = spawn(cmd, args, {
     cwd: path.dirname(cmd),
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, ARB_PORT: backendPort, ARB_DESKTOP: '1', ARB_TOKEN: apiToken }
+    env: {
+      ...process.env,
+      ARB_PORT: backendPort,
+      ARB_DESKTOP: '1',
+      ARB_TOKEN: apiToken,
+      ARB_DATA_DIR: app.getPath('userData')
+    }
   });
 
   backendProcess.stdout.on('data', (data) => {

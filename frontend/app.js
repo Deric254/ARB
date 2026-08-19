@@ -225,8 +225,11 @@ async function saveKeys(exchange) {
     const res = await fetch(`${API_BASE}/api/config/keys/${exchange}`, {
       method: 'POST', headers: authHeaders({'Content-Type': 'application/json'}), body: JSON.stringify(data)
     });
-    const json = await res.json();
-    alert(json.ok ? `${exchange.toUpperCase()} keys saved!` : 'Failed to save');
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok || !json.ok) {
+      throw new Error(json.detail || `HTTP ${res.status}`);
+    }
+    alert(`${exchange.toUpperCase()} keys saved!`);
   } catch (e) { alert('Error: ' + e.message); }
 }
 

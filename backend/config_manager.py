@@ -1,10 +1,20 @@
 import sqlite3
 import json
 import os
+import shutil
 from cryptography.fernet import Fernet
 from typing import Optional, Dict
 
-DB_PATH = os.path.join(os.path.dirname(__file__), 'config.db')
+DATA_DIR = os.environ.get('ARB_DATA_DIR', os.path.dirname(__file__))
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_PATH = os.path.join(DATA_DIR, 'config.db')
+
+if os.path.abspath(DATA_DIR) != os.path.abspath(os.path.dirname(__file__)):
+    for filename in ('config.db', '.key'):
+        legacy_path = os.path.join(os.path.dirname(__file__), filename)
+        target_path = os.path.join(DATA_DIR, filename)
+        if os.path.exists(legacy_path) and not os.path.exists(target_path):
+            shutil.copy2(legacy_path, target_path)
 
 class ConfigManager:
     def __init__(self):
@@ -13,7 +23,7 @@ class ConfigManager:
         self._init_db()
 
     def _get_or_create_key(self) -> bytes:
-        key_path = os.path.join(os.path.dirname(__file__), '.key')
+        key_path = os.path.join(DATA_DIR, '.key')
         if os.path.exists(key_path):
             with open(key_path, 'rb') as f:
                 return f.read()
