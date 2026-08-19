@@ -12,8 +12,9 @@ log.initialize();
 const isDev = !app.isPackaged;
 const RESOURCES_PATH = isDev ? __dirname : process.resourcesPath;
 const BACKEND_DIR = path.join(RESOURCES_PATH, 'backend');
-const FRONTEND_DIR = path.join(RESOURCES_PATH, 'frontend');
-const BUILD_DIR = path.join(RESOURCES_PATH, 'build');
+const APP_PATH = app.getAppPath();
+const FRONTEND_DIR = path.join(APP_PATH, 'frontend');
+const BUILD_DIR = path.join(APP_PATH, 'build');
 
 let mainWindow = null;
 let splashWindow = null;
