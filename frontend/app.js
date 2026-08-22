@@ -49,8 +49,8 @@ function updateKPIs(data) {
   document.getElementById('kpiRate').textContent = (data.success_rate || 0) + '%';
   document.getElementById('kpiDetected').textContent = data.detected || 0;
   document.getElementById('kpiExecuted').textContent = data.executed || 0;
-  document.getElementById('kpiLatency').textContent = '50 ms';
-  document.getElementById('kpiSpread').textContent = '12 bps';
+  document.getElementById('kpiLatency').textContent = (data.avg_latency_ms || 0) + ' ms';
+  document.getElementById('kpiSpread').textContent = (data.avg_spread_bps || 0) + ' bps';
   document.getElementById('kpiDaily').textContent = data.daily_trades || 0;
   document.getElementById('kpiCircuit').textContent = data.circuit_state || 'CLOSED';
   document.getElementById('kpiCircuit').style.color = (data.circuit_state === 'CLOSED') ? 'var(--green)' : 'var(--red)';
@@ -59,6 +59,27 @@ function updateKPIs(data) {
   const badge = document.getElementById('modeBadge');
   badge.textContent = data.mode || 'STOPPED';
   badge.className = 'mode-badge mode-' + (data.mode || 'stopped').toLowerCase();
+
+  updateCircuitBanner(data);
+}
+
+function updateCircuitBanner(data) {
+  const banner = document.getElementById('circuitBanner');
+  if (!banner) return;
+  if (data.circuit_state === 'OPEN') {
+    banner.classList.remove('hidden');
+    document.getElementById('circuitReasonText').textContent = data.circuit_reason || 'Circuit breaker is open — trading paused.';
+    document.getElementById('resetCircuitBtn').classList.toggle('hidden', !data.circuit_auto_clearable);
+  } else {
+    banner.classList.add('hidden');
+  }
+}
+
+async function resetCircuit() {
+  try {
+    await fetch(`${API_BASE}/api/engine/reset-circuit`, {method: 'POST', headers: authHeaders()});
+    fetchStatus();
+  } catch (e) { alert('Error: ' + e.message); }
 }
 
 function updateExTable(data) {
@@ -67,9 +88,34 @@ function updateExTable(data) {
   for (const [name, info] of Object.entries(data.exchanges || {})) {
     const color = info.connected ? 'var(--green)' : 'var(--red)';
     const status = info.connected ? 'CONNECTED' : 'DISCONNECTED';
-    html += `<tr><td><strong>${name.toUpperCase()}</strong></td><td style="color:${color}">${status}</td><td>${info.msgs || 0}</td><td>${JSON.stringify(info.balances || {})}</td></tr>`;
+    const detail = info.connected ? JSON.stringify(info.balances || {}) : (info.error || '');
+    html += `<tr><td><strong>${name.toUpperCase()}</strong></td><td style="color:${color}">${status}</td><td>${info.msgs || 0}</td><td>${detail}</td></tr>`;
   }
-  tbody.innerHTML = html;
+  tbody.innerHTML = html || '<tr><td colspan="4" style="text-align:center;color:var(--text-dim)">No exchanges configured — add API keys in Settings</td></tr>';
+}
+
+// Independent of the trading engine: shows real saved-key connection status
+// and balances immediately, whether or not the engine has been started.
+// This is what makes balances "stick" across an app restart instead of
+// only ever showing up after Start is clicked again.
+async function fetchExchangeStatus() {
+  try {
+    const res = await fetch(`${API_BASE}/api/exchanges/status`, { headers: authHeaders() });
+    const data = await res.json();
+    // Only use this to populate the table when the engine itself isn't
+    // running (once it's running, /api/status's live msgs/balances take
+    // over and are more current).
+    if (!engineRunning) updateExTable(data);
+    if (data.pending_live_resume) {
+      document.getElementById('liveResumeBanner')?.classList.remove('hidden');
+    }
+  } catch (e) { console.log('Exchange status fetch error', e); }
+}
+
+async function resumeLiveTrading() {
+  document.getElementById('modeSelect').value = 'live';
+  await startEngine();
+  document.getElementById('liveResumeBanner')?.classList.add('hidden');
 }
 
 async function loadTrades() {
@@ -94,6 +140,12 @@ function updateCharts(data) {
   const pnls = hist.map(h => h.pnl || 0);
   const dets = hist.map(h => h.detected || 0);
   const execs = hist.map(h => h.executed || 0);
+  const lats = hist.map(h => h.latency_ms || 0);
+  const spreadA = hist.map(h => h.spread_a || 0);
+  const spreadB = hist.map(h => h.spread_b || 0);
+  const priceA = hist.map(h => h.price_a || 0);
+  const priceB = hist.map(h => h.price_b || 0);
+  const circuit = hist.map(h => (h.circuit === undefined ? 1 : h.circuit));
 
   charts.pnl.data.labels = labels;
   charts.pnl.data.datasets[0].data = pnls;
@@ -103,7 +155,27 @@ function updateCharts(data) {
   charts.sig.data.datasets[0].data = dets;
   charts.sig.data.datasets[1].data = execs;
   charts.sig.update('none');
+
+  charts.lat.data.labels = labels;
+  charts.lat.data.datasets[0].data = lats;
+  charts.lat.update('none');
+
+  charts.spread.data.labels = labels;
+  charts.spread.data.datasets[0].data = spreadA;
+  charts.spread.data.datasets[1].data = spreadB;
+  charts.spread.update('none');
+
+  charts.price.data.labels = labels;
+  charts.price.data.datasets[0].data = priceA;
+  charts.price.data.datasets[1].data = priceB;
+  charts.price.update('none');
+
+  charts.circuit.data.labels = labels;
+  charts.circuit.data.datasets[0].data = circuit;
+  charts.circuit.update('none');
 }
+
+let engineRunning = false;
 
 async function fetchStatus() {
   try {
@@ -114,6 +186,7 @@ async function fetchStatus() {
     updateCharts(data);
 
     const running = data.running;
+    engineRunning = running;
     document.getElementById('startBtn').classList.toggle('hidden', running);
     document.getElementById('stopBtn').classList.toggle('hidden', !running);
   } catch (e) { console.log('Status fetch error', e); }
@@ -339,6 +412,7 @@ function connectWS() {
     ws = new WebSocket(`ws://localhost:8765/ws?token=${encodeURIComponent(API_TOKEN)}`);
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
+      engineRunning = data.running;
       updateKPIs(data);
       updateExTable(data);
     };
@@ -354,9 +428,11 @@ async function init() {
   initCharts();
   loadBranding();
   fetchStatus();
+  fetchExchangeStatus();
   loadTrades();
   connectWS();
   setInterval(fetchStatus, 3000);
+  setInterval(fetchExchangeStatus, 5000);
   setInterval(loadTrades, 5000);
 }
 init();

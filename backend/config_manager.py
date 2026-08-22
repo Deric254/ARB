@@ -110,6 +110,21 @@ class ConfigManager:
             'fixed_cost_usd': '2.50',
         }
 
+    def save_engine_state(self, running: bool, mode: str):
+        """Persists whether the engine was running and in what mode, so a
+        restart can seamlessly resume DEMO/PAPER instead of forcing the user
+        to reconnect and re-click Start every single launch. LIVE is
+        intentionally excluded from auto-resume — see /api/exchanges/status
+        and the startup handler in main.py; real-money trading must always
+        require an explicit human click, restart or not."""
+        self.set('engine_state', json.dumps({'running': running, 'mode': mode}))
+
+    def get_engine_state(self) -> Dict:
+        raw = self.get('engine_state')
+        if raw:
+            return json.loads(raw)
+        return {'running': False, 'mode': 'demo'}
+
     def save_branding(self, name: str, slogan: str):
         self.set('brand_name', name)
         self.set('brand_slogan', slogan)

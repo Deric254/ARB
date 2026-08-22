@@ -8,6 +8,28 @@ const log = require('electron-log');
 
 log.initialize();
 
+// Only one copy of ARB Pro should ever run at once — a second launch (e.g.
+// double-clicking the icon again while the first copy is hidden in the
+// tray after minimizing on Windows) would otherwise spawn a second backend
+// on the same fixed port, fail to bind, and the whole app would quit with
+// a confusing "Backend failed to start" error. Refuse the second instance
+// outright and just focus the existing window instead.
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+}
+
+app.on('second-instance', () => {
+  if (mainWindow) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  } else if (splashWindow) {
+    splashWindow.show();
+    splashWindow.focus();
+  }
+});
+
 // Paths
 const isDev = !app.isPackaged;
 const RESOURCES_PATH = isDev ? __dirname : process.resourcesPath;
@@ -22,6 +44,7 @@ let tray = null;
 let backendProcess = null;
 let backendPort = 8765;
 let backendReady = false;
+let backendRetried = false;
 // Generated fresh each launch, never written to disk. Passed to the
 // backend via env var and to the renderer via IPC so every request
 // can be authenticated without a login step.
@@ -65,6 +88,7 @@ function pollBackendReady(maxWaitMs = 30000, intervalMs = 300) {
       res.resume();
       if (res.statusCode === 200 && !backendReady) {
         backendReady = true;
+        backendRetried = false;
         log.info('Backend HTTP ready on port', backendPort);
         if (splashWindow && !splashWindow.isDestroyed()) {
           splashWindow.close();
@@ -120,13 +144,18 @@ function startBackend() {
     }
   });
 
+  let recentStderr = [];
+
   backendProcess.stdout.on('data', (data) => {
     const line = data.toString().trim();
     log.info('[PY]', line);
   });
 
   backendProcess.stderr.on('data', (data) => {
-    log.error('[PY-ERR]', data.toString().trim());
+    const line = data.toString().trim();
+    log.error('[PY-ERR]', line);
+    recentStderr.push(line);
+    if (recentStderr.length > 20) recentStderr.shift();
   });
 
   backendProcess.on('close', (code) => {
@@ -134,6 +163,25 @@ function startBackend() {
     backendReady = false;
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('backend-disconnected');
+    }
+
+    // A non-zero exit before the backend ever came up almost always means
+    // something is already holding the port (a stray process from an
+    // unclean previous shutdown) rather than a real startup failure — one
+    // silent retry after giving the OS a moment to release the port fixes
+    // the large majority of "app just quits on launch" reports without
+    // bothering the user at all.
+    if (code !== 0 && !backendReady && !backendRetried) {
+      backendRetried = true;
+      const errText = recentStderr.join('\n');
+      log.warn('Backend exited abnormally before becoming ready, retrying once in 2s. Last stderr:\n' + errText);
+      setTimeout(() => startBackend(), 2000);
+    } else if (code !== 0 && !backendReady && backendRetried) {
+      const errText = recentStderr.slice(-5).join('\n') || 'No error output captured.';
+      if (splashWindow && !splashWindow.isDestroyed()) splashWindow.close();
+      dialog.showErrorBox('Backend Failed To Start',
+        'The trading engine backend could not start after a retry.\n\n' + errText);
+      app.quit();
     }
   });
 

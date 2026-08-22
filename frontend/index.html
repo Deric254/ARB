@@ -50,6 +50,14 @@
   </div>
 
   <div id="dashboardPage">
+    <div id="circuitBanner" class="hidden" style="background:#3a1414;border:1px solid var(--red);border-radius:8px;padding:12px 16px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;gap:12px;">
+      <div><strong style="color:var(--red)">CIRCUIT BREAKER OPEN</strong> — <span id="circuitReasonText"></span></div>
+      <button class="btn btn-red" id="resetCircuitBtn" onclick="resetCircuit()">Reset Circuit Breaker</button>
+    </div>
+    <div id="liveResumeBanner" class="hidden" style="background:#2a2410;border:1px solid var(--yellow);border-radius:8px;padding:12px 16px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;gap:12px;">
+      <div><strong style="color:var(--yellow)">LIVE session was interrupted</strong> — resume trading with real funds, or leave stopped.</div>
+      <button class="btn btn-green" onclick="resumeLiveTrading()">Resume LIVE Trading</button>
+    </div>
     <div class="kpi-grid">
       <div class="kpi"><div class="kpi-value" id="kpiPnl" style="color:var(--green)">$0.00</div><div class="kpi-label">Total P&L</div></div>
       <div class="kpi"><div class="kpi-value" id="kpiRate" style="color:var(--yellow)">0.0%</div><div class="kpi-label">Success Rate</div></div>

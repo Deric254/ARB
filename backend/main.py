@@ -211,8 +211,13 @@ class ExMan:
     async def _demo_loop(self):
         while not self._shutdown:
             px = self._demo_base + random.uniform(-300, 300)
-            bids = [OBLevel(Decimal(str(px - i * 10)), Decimal(str(random.uniform(0.1, 2.0)))) for i in range(20)]
-            asks = [OBLevel(Decimal(str(px + i * 10)), Decimal(str(random.uniform(0.1, 2.0)))) for i in range(20)]
+            # Real order books never have best_bid == best_ask — leave a
+            # small realistic spread (~2 bps) so demo-mode analytics show
+            # honest, non-zero spread/price-divergence figures instead of
+            # a degenerate zero.
+            half_spread = px * 0.0001
+            bids = [OBLevel(Decimal(str(px - half_spread - i * 10)), Decimal(str(random.uniform(0.1, 2.0)))) for i in range(20)]
+            asks = [OBLevel(Decimal(str(px + half_spread + i * 10)), Decimal(str(random.uniform(0.1, 2.0)))) for i in range(20)]
             self._ob = OrderBook(bids, asks, time.time_ns())
             self.last_up = time.time()
             self.msgs += 1
@@ -475,6 +480,10 @@ class ArbEngine:
         self._tasks.append(asyncio.create_task(self._det_loop(vol, min_profit, max_slip, paper or demo, poll_ms, live=not (demo or paper), symbol=symbol, depth=depth, sizing_mode=sizing_mode, size_pct=size_pct, fixed_cost=fixed_cost)))
         self._tasks.append(asyncio.create_task(self._metrics_loop()))
         LOG.info("ENGINE ONLINE")
+        # Persist so a restart can seamlessly resume DEMO/PAPER. LIVE is
+        # deliberately never auto-resumed (see startup handler below) —
+        # real-money trading always needs an explicit human click.
+        self.cfg_mgr.save_engine_state(True, mode)
         return True
 
     async def _det_loop(self, vol: Decimal, min_profit: Decimal, max_slip: Decimal, paper: bool, poll_ms: int, live: bool, symbol: str, depth: int, sizing_mode: str = 'fixed', size_pct: Decimal = Decimal("0.1"), fixed_cost: Decimal = Decimal("2.50")):
@@ -785,14 +794,44 @@ class ArbEngine:
             try:
                 await asyncio.wait_for(self._shutdown.wait(), timeout=2.0)
             except asyncio.TimeoutError:
+                names = list(self.exs.keys())[:2]
+                spread_a = spread_b = price_a = price_b = 0.0
+                if len(names) >= 1:
+                    ob = self.exs[names[0]].get_ob()
+                    if ob and ob.best_bid() and ob.best_ask():
+                        price_a = float(ob.mid())
+                        spread_a = float((ob.best_ask() - ob.best_bid()) / ob.mid() * 10000)
+                if len(names) >= 2:
+                    ob = self.exs[names[1]].get_ob()
+                    if ob and ob.best_bid() and ob.best_ask():
+                        price_b = float(ob.mid())
+                        spread_b = float((ob.best_ask() - ob.best_bid()) / ob.mid() * 10000)
                 snapshot = {
                     "ts": time.time(),
                     "pnl": float(self._get_total_pnl()),
                     "detected": self.detected,
                     "executed": self.executed,
+                    "latency_ms": self._avg_recent_latency(),
+                    "spread_a": round(spread_a, 2),
+                    "spread_b": round(spread_b, 2),
+                    "price_a": price_a,
+                    "price_b": price_b,
+                    "circuit": 0 if self._circuit_open else 1,
                     "exchanges": {n: {"connected": e.connected, "msgs": e.msgs, "balances": {k: str(v) for k, v in e._balances.items()}} for n, e in self.exs.items()}
                 }
                 self._history.append(snapshot)
+
+    def _avg_recent_latency(self, n: int = 20) -> float:
+        """Real average execution latency from the most recent filled trades
+        — not a placeholder. Returns 0 if nothing has executed yet."""
+        conn = sqlite3.connect(self._trades_db)
+        rows = conn.execute(
+            "SELECT latency_ms FROM trades WHERE status IN ('FILLED','UNWOUND') ORDER BY id DESC LIMIT ?", (n,)
+        ).fetchall()
+        conn.close()
+        if not rows:
+            return 0.0
+        return round(sum(r[0] for r in rows) / len(rows), 1)
 
     def _get_total_pnl(self):
         conn = sqlite3.connect(self._trades_db)
@@ -812,6 +851,7 @@ class ArbEngine:
             await ex.shutdown()
         self.running = False
         self._status = {"mode": "STOPPED", "message": "Engine stopped"}
+        self.cfg_mgr.save_engine_state(False, self._status.get("mode", "demo").lower())
 
     def get_status(self):
         portfolio_usdt = sum((e.usdt_value for e in self.exs.values()), Decimal("0"))
@@ -823,6 +863,8 @@ class ArbEngine:
             "executed": self.executed,
             "success_rate": round(self.executed / max(self.detected, 1) * 100, 1),
             "total_pnl": str(self._get_total_pnl()),
+            "avg_latency_ms": self._avg_recent_latency(),
+            "avg_spread_bps": round((self._history[-1]["spread_a"] + self._history[-1]["spread_b"]) / 2, 2) if self._history else 0.0,
             "exchanges": {n: {"connected": e.connected, "msgs": e.msgs, "balances": {k: str(v) for k, v in e._balances.items()}, "usdt_value": str(e.usdt_value)} for n, e in self.exs.items()},
             "portfolio_usdt_value": str(portfolio_usdt),
             "history": list(self._history),
@@ -909,10 +951,76 @@ class ArbEngine:
 app = FastAPI(title="ARB Pro Backend", version="6.0.0")
 cfg_mgr = ConfigManager()
 engine = ArbEngine(cfg_mgr)
+# Set when a LIVE session was interrupted (app closed/crashed) so the
+# frontend can prompt the user to explicitly resume rather than silently
+# never trading again. Never auto-cleared except by an explicit start/stop.
+pending_live_resume = False
+
+@app.on_event("startup")
+async def _resume_last_session():
+    """Restores the pre-restart state instead of leaving the user to
+    reconnect exchanges and re-click Start from scratch every launch.
+    DEMO/PAPER resume automatically (no capital at risk). LIVE never
+    auto-resumes — it only sets a flag so the UI can ask for one explicit
+    click, which is the right tradeoff between 'seamless' and 'never move
+    real money without a human in the loop'."""
+    global pending_live_resume
+    state = cfg_mgr.get_engine_state()
+    if not state.get('running'):
+        return
+    mode = state.get('mode', 'demo')
+    if mode in ('demo', 'paper'):
+        LOG.info("Resuming previous %s session automatically", mode.upper())
+        await engine.start(mode)
+    elif mode == 'live':
+        pending_live_resume = True
+        LOG.warning("Previous LIVE session was interrupted — waiting for explicit resume via UI")
 
 @app.get("/")
 def root():
     return {"status": "ARB Pro Backend v6.0", "mode": engine._status.get("mode", "STOPPED")}
+
+@app.get("/api/exchanges/status", dependencies=[Depends(verify_token)])
+async def exchanges_status():
+    """Independent of the trading engine: fetches connection + balance for
+    every exchange that has saved API keys, so the dashboard can show real
+    balances immediately on launch without requiring the engine to be
+    started first. This is what was missing before — balances only ever
+    lived inside the engine's in-memory state, so they vanished on every
+    restart until Start was clicked again."""
+    if not CCXT_OK:
+        return {"exchanges": {}, "error": "ccxt not installed"}
+    ex_defs = ["binance", "okx", "bybit", "bitget", "mexc"]
+    results = {}
+
+    async def check(name):
+        keys = cfg_mgr.get_exchange_keys(name)
+        if not (keys['api_key'] and keys['api_secret']):
+            return name, None
+        cls = getattr(ccxt, name, None)
+        if not cls:
+            return name, {"connected": False, "error": "unsupported exchange"}
+        params = {"apiKey": keys['api_key'], "secret": keys['api_secret'], "enableRateLimit": True, "options": {"defaultType": "spot"}}
+        if keys.get('passphrase'):
+            params["password"] = keys['passphrase']
+        inst = cls(params)
+        try:
+            bal = await inst.fetch_balance()
+            balances = {k: str(v.get("free", 0)) for k, v in bal.items() if isinstance(v, dict) and float(v.get("free", 0) or 0) > 0}
+            return name, {"connected": True, "balances": balances}
+        except Exception as e:
+            return name, {"connected": False, "error": str(e)}
+        finally:
+            try:
+                await inst.close()
+            except Exception:
+                pass
+
+    pairs = await asyncio.gather(*[check(n) for n in ex_defs])
+    for name, info in pairs:
+        if info is not None:
+            results[name] = info
+    return {"exchanges": results, "pending_live_resume": pending_live_resume}
 
 @app.get("/api/status", dependencies=[Depends(verify_token)])
 def get_status():
@@ -965,12 +1073,17 @@ async def save_branding(data: dict):
 
 @app.post("/api/engine/start", dependencies=[Depends(verify_token)])
 async def start_engine(data: dict):
+    global pending_live_resume
     mode = data.get("mode", "demo")
     ok = await engine.start(mode)
+    if ok:
+        pending_live_resume = False
     return {"ok": ok, "mode": mode}
 
 @app.post("/api/engine/stop", dependencies=[Depends(verify_token)])
 async def stop_engine():
+    global pending_live_resume
+    pending_live_resume = False
     await engine.stop()
     return {"ok": True}
 
